@@ -54,13 +54,13 @@ fn id_param(p: &Value, cmd: &str) -> Result<AssistantId> {
 
 fn item_json(a: &DrawingAssistantItem) -> Value {
     let (kind, detail) = match &a.kind {
-        DrawingAssistantKind::StraightLine(l) => ("straightLine", json!({"anchor": l.anchor, "angleDeg": l.angle_deg})),
+        DrawingAssistantKind::StraightLine(l) => ("straightLine", json!({"anchor": l.anchor, "angleDeg": l.angle_deg, "length": l.length})),
         DrawingAssistantKind::Perspective(p) => (
             "perspective",
-            json!({"points": p.vps, "horizonY": p.horizon_y, "rays": p.rays.iter().map(|r| json!({"vp": r.vp, "angleDeg": r.angle_deg})).collect::<Vec<_>>()}),
+            json!({"points": p.vps, "horizonY": p.horizon_y, "length": p.length, "rays": p.rays.iter().map(|r| json!({"vp": r.vp, "angleDeg": r.angle_deg})).collect::<Vec<_>>()}),
         ),
         DrawingAssistantKind::Bezier(b) => ("bezier", json!({"points": b.points})),
-        DrawingAssistantKind::Parallel(p) => ("parallel", json!({"anchor": p.anchor, "angleDeg": p.angle_deg, "spacing": p.spacing})),
+        DrawingAssistantKind::Parallel(p) => ("parallel", json!({"anchor": p.anchor, "angleDeg": p.angle_deg, "spacing": p.spacing, "length": p.length})),
         DrawingAssistantKind::Ellipse(e) => ("ellipse", json!({"center": e.center, "radii": e.radii, "rotationDeg": e.rotation_deg})),
         DrawingAssistantKind::Concentric(c) => ("concentric", json!({"center": c.center, "spacing": c.spacing})),
         DrawingAssistantKind::Polygon(g) => ("polygon", json!({"center": g.center, "radius": g.radius, "sides": g.sides, "rotationDeg": g.rotation_deg})),
@@ -88,6 +88,12 @@ fn check_capacity(s: &Session, cmd: &str) -> Result<()> {
         return Err(bad(cmd, format!("the document already holds {MAX_ASSISTANTS} assistants")));
     }
     Ok(())
+}
+
+/// Default guide length: the canvas diagonal, so new rulers span the document finitely.
+fn diagonal(s: &Session) -> Result<f64> {
+    let st = s.active().ok_or(EngineError::NoDocument)?;
+    Ok(f64::from(st.doc.size.width).hypot(f64::from(st.doc.size.height)))
 }
 
 fn next_name(s: &Session, prefix: &str) -> String {
@@ -126,8 +132,9 @@ fn add_straight(s: &mut Session, p: &Value) -> Result<Value> {
     let center = [f64::from(st.doc.size.width) / 2.0, f64::from(st.doc.size.height) / 2.0];
     let anchor = anchor_param(p, CMD, "anchor", center)?;
     let angle = angle_param(p, CMD, "angleDeg", 0.0)?;
-    let line = StraightLineAssistant::new(anchor, angle)
+    let mut line = StraightLineAssistant::new(anchor, angle)
         .ok_or_else(|| bad(CMD, "`anchor` must be finite coordinates within ±1000000 and `angleDeg` a finite angle"))?;
+    line.length = diagonal(s)?;
     let name = name_param(s, p, "Straight Line");
     let mut out = Value::Null;
     s.edit("Add Assistant", |doc, _| {
@@ -173,8 +180,9 @@ fn add_perspective(s: &mut Session, p: &Value) -> Result<Value> {
         None => 15.0,
         Some(v) => v.as_f64().ok_or_else(|| bad(CMD, "`rayStep` must be a number (degrees)"))?,
     };
-    let guide = PerspectiveAssistant::with_default_rays(points, horizon, step)
+    let mut guide = PerspectiveAssistant::with_default_rays(points, horizon, step)
         .ok_or_else(|| bad(CMD, "need 1–8 finite vanishing points within ±1000000, a finite `horizonY`, and a `rayStep` between 0° and 180°"))?;
+    guide.length = diagonal(s)?;
     let name = name_param(s, p, "Perspective");
     let mut out = Value::Null;
     s.edit("Add Assistant", |doc, _| {
@@ -279,10 +287,14 @@ fn move_anchor(s: &mut Session, p: &Value) -> Result<Value> {
         let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
         match &mut a.kind {
             DrawingAssistantKind::StraightLine(line) => {
+                let len = line.length;
                 *line = StraightLineAssistant::new(anchor, line.angle_deg).ok_or_else(|| bad(CMD, "`anchor` must be within ±1000000"))?;
+                line.length = len;
             }
             DrawingAssistantKind::Parallel(par) => {
+                let len = par.length;
                 *par = ParallelAssistant::new(anchor, par.angle_deg, par.spacing).ok_or_else(|| bad(CMD, "`anchor` must be within ±1000000"))?;
+                par.length = len;
             }
             DrawingAssistantKind::Concentric(con) => {
                 *con = ConcentricAssistant::new(anchor, con.spacing).ok_or_else(|| bad(CMD, "`anchor` must be within ±1000000"))?;
@@ -310,10 +322,14 @@ fn set_angle(s: &mut Session, p: &Value) -> Result<Value> {
         let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
         match &mut a.kind {
             DrawingAssistantKind::StraightLine(line) => {
+                let len = line.length;
                 *line = StraightLineAssistant::new(line.anchor, angle).ok_or_else(|| bad(CMD, "`angleDeg` must be a finite angle"))?;
+                line.length = len;
             }
             DrawingAssistantKind::Parallel(par) => {
+                let len = par.length;
                 *par = ParallelAssistant::new(par.anchor, angle, par.spacing).ok_or_else(|| bad(CMD, "`angleDeg` must be a finite angle"))?;
+                par.length = len;
             }
             _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "this assistant has no angle".into() }),
         }
@@ -525,8 +541,9 @@ fn add_parallel(s: &mut Session, p: &Value) -> Result<Value> {
     let anchor = anchor_param(p, CMD, "anchor", center)?;
     let angle = angle_param(p, CMD, "angleDeg", 0.0)?;
     let spacing = num_param(p, CMD, "spacing", 20.0)?;
-    let par = ParallelAssistant::new(anchor, angle, spacing)
+    let mut par = ParallelAssistant::new(anchor, angle, spacing)
         .ok_or_else(|| bad(CMD, "need a finite `anchor` within ±1000000, a finite `angleDeg`, and a `spacing` between 0 and ±1000000 (exclusive of 0)"))?;
+    par.length = diagonal(s)?;
     let name = name_param(s, p, "Parallel");
     let mut out = Value::Null;
     s.edit("Add Assistant", |doc, _| {
@@ -744,6 +761,31 @@ fn set_color(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(json!({"id": id.0, "color": color.id()}))
+}
+
+/// Resize a straight-line, parallel or perspective guide (the popup Length slider).
+/// Positive and finite; the horizon and the lens-bounded fisheye need no length.
+fn set_length(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.setLength";
+    let id = get_mut(s, CMD, p)?;
+    let length = num_param(p, CMD, "length", f64::NAN)?;
+    if p.get("length").is_none() {
+        return Err(bad(CMD, "missing `length`"));
+    }
+    if !length.is_finite() || length <= 0.0 || length > photocraft_doc::MAX_ASSISTANT_COORDINATE {
+        return Err(bad(CMD, "`length` must be positive and within ±1000000"));
+    }
+    s.edit("Resize Assistant", |doc, _| {
+        let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
+        match &mut a.kind {
+            DrawingAssistantKind::StraightLine(line) => line.length = length,
+            DrawingAssistantKind::Parallel(par) => par.length = length,
+            DrawingAssistantKind::Perspective(guide) => guide.length = length,
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only straight-line, parallel and perspective guides have a length".into() }),
+        }
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "length": length}))
 }
 
 /// Assistant command specs.
@@ -997,6 +1039,16 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"id":assistant id,"color":label id ("red", …, "none")} — "none" is the theme magenta"##,
             enabled: has_doc,
             run: set_color,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.setLength",
+            label: "Resize Assistant Guide",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":straight-line/parallel/perspective assistant id,"length":px} — finite extent, never infinite"##,
+            enabled: has_doc,
+            run: set_length,
             journal: true,
         },
     ]

@@ -119,17 +119,19 @@ fn usable_radius(radius: f64) -> bool {
 }
 
 /// A straight-line (parallel/isometric angle) ruler: strokes snap onto the line through
-/// `anchor` at `angle_deg` degrees.
+/// `anchor` at `angle_deg` degrees. `length` bounds the segment (0 or negative keeps the
+/// legacy infinite line, so older bundles still open); new rulers are always finite.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StraightLineAssistant {
     pub anchor: [f64; 2],
     pub angle_deg: f64,
+    pub length: f64,
 }
 
 impl Default for StraightLineAssistant {
     fn default() -> Self {
-        Self { anchor: [0.0, 0.0], angle_deg: 0.0 }
+        Self { anchor: [0.0, 0.0], angle_deg: 0.0, length: 0.0 }
     }
 }
 
@@ -139,7 +141,12 @@ impl StraightLineAssistant {
         if !in_range(anchor) || dir_from_deg(angle_deg).is_none() {
             return None;
         }
-        Some(Self { anchor, angle_deg })
+        Some(Self { anchor, angle_deg, length: 0.0 })
+    }
+
+    /// Half-extent of the segment, or `None` for the legacy infinite line.
+    fn half(self) -> Option<f64> {
+        (self.length.is_finite() && self.length > 0.0).then_some(0.5 * self.length)
     }
 
     fn direction(self) -> Option<[f64; 2]> {
@@ -163,9 +170,16 @@ pub struct PerspectiveAssistant {
     pub vps: Vec<[f64; 2]>,
     pub horizon_y: Option<f64>,
     pub rays: Vec<PerspectiveRay>,
+    /// Ray length from each vanishing point (0 or negative keeps the legacy infinite rays).
+    pub length: f64,
 }
 
 impl PerspectiveAssistant {
+    /// Ray extent from each vanishing point, or `None` for infinite rays.
+    fn ray_len(&self) -> Option<f64> {
+        (self.length.is_finite() && self.length > 0.0).then_some(self.length)
+    }
+
     /// `None` when there are no (or too many) vanishing points, a point is out of range, the
     /// horizon is non-finite, a ray is invalid, or a ray names no vanishing point.
     pub fn new(vps: Vec<[f64; 2]>, horizon_y: Option<f64>, rays: Vec<PerspectiveRay>) -> Option<Self> {
@@ -178,7 +192,7 @@ impl PerspectiveAssistant {
         if rays.len() > MAX_RAYS || rays.iter().any(|r| r.vp >= vps.len() || dir_from_deg(r.angle_deg).is_none()) {
             return None;
         }
-        Some(Self { vps, horizon_y, rays })
+        Some(Self { vps, horizon_y, rays, length: 0.0 })
     }
 
     /// Vanishing points with a fan of rays every `step_deg` degrees plus the horizon through
@@ -218,7 +232,7 @@ fn valid_spacing(s: f64) -> bool {
 
 /// Nearest snap of `point` onto explicit perspective rays plus an optional horizon.
 /// Returns the snapped point and its distance; the caller applies the radius.
-fn snap_to_rays(vps: &[[f64; 2]], rays: &[PerspectiveRay], horizon_y: Option<f64>, point: [f64; 2]) -> Option<([f64; 2], f64)> {
+fn snap_to_rays(vps: &[[f64; 2]], rays: &[PerspectiveRay], horizon_y: Option<f64>, point: [f64; 2], ray_len: Option<f64>) -> Option<([f64; 2], f64)> {
     let mut best: Option<([f64; 2], f64)> = None;
     let mut consider = |q: [f64; 2], dist: f64| {
         if finite2(q) && best.is_none_or(|(_, bd)| dist < bd) {
@@ -229,6 +243,12 @@ fn snap_to_rays(vps: &[[f64; 2]], rays: &[PerspectiveRay], horizon_y: Option<f64
         let (Some(vp), Some(d)) = (vps.get(ray.vp).copied(), dir_from_deg(ray.angle_deg)) else { continue };
         if !in_range(vp) {
             continue;
+        }
+        if let Some(len) = ray_len {
+            let t = (point[0] - vp[0]) * d[0] + (point[1] - vp[1]) * d[1];
+            if t < 0.0 || t > len {
+                continue;
+            }
         }
         let (q, dist) = project(point, vp, d);
         consider(q, dist);
@@ -319,11 +339,13 @@ pub struct ParallelAssistant {
     pub anchor: [f64; 2],
     pub angle_deg: f64,
     pub spacing: f64,
+    /// Segment length like [`StraightLineAssistant::length`]: 0 or negative is infinite.
+    pub length: f64,
 }
 
 impl Default for ParallelAssistant {
     fn default() -> Self {
-        Self { anchor: [0.0, 0.0], angle_deg: 0.0, spacing: 20.0 }
+        Self { anchor: [0.0, 0.0], angle_deg: 0.0, spacing: 20.0, length: 0.0 }
     }
 }
 
@@ -333,7 +355,12 @@ impl ParallelAssistant {
         if !in_range(anchor) || dir_from_deg(angle_deg).is_none() || !valid_spacing(spacing) {
             return None;
         }
-        Some(Self { anchor, angle_deg, spacing })
+        Some(Self { anchor, angle_deg, spacing, length: 0.0 })
+    }
+
+    /// Half-extent of each family segment, or `None` for infinite lines.
+    fn half(self) -> Option<f64> {
+        (self.length.is_finite() && self.length > 0.0).then_some(0.5 * self.length)
     }
 
     fn direction(self) -> Option<[f64; 2]> {
@@ -623,13 +650,25 @@ impl DrawingAssistant for StraightLineAssistant {
         }
         let d = self.direction()?;
         let (q, dist) = project(point, self.anchor, d);
+        if let Some(half) = self.half() {
+            let t = (point[0] - self.anchor[0]) * d[0] + (point[1] - self.anchor[1]) * d[1];
+            if t.abs() > half {
+                return None;
+            }
+        }
         (dist <= snap_radius && finite2(q)).then_some(q)
     }
 
     fn overlay_primitives(&self, viewport: [f64; 4]) -> Vec<GuidePrimitive> {
         let mut out = Vec::new();
         let Some(d) = self.direction() else { return out };
-        if let Some([a, b]) = clip_line(self.anchor, d, viewport) {
+        if let Some(half) = self.half() {
+            out.push(GuidePrimitive::Segment {
+                a: [self.anchor[0] - d[0] * half, self.anchor[1] - d[1] * half],
+                b: [self.anchor[0] + d[0] * half, self.anchor[1] + d[1] * half],
+                major: true,
+            });
+        } else if let Some([a, b]) = clip_line(self.anchor, d, viewport) {
             out.push(GuidePrimitive::Segment { a, b, major: true });
         }
         out.push(GuidePrimitive::Handle { pos: self.anchor, kind: HandleKind::Anchor });
@@ -649,7 +688,7 @@ impl DrawingAssistant for PerspectiveAssistant {
         if !finite2(point) || !usable_radius(snap_radius) {
             return None;
         }
-        let (q, dist) = snap_to_rays(&self.vps, &self.rays, self.horizon_y, point)?;
+        let (q, dist) = snap_to_rays(&self.vps, &self.rays, self.horizon_y, point, self.ray_len())?;
         (dist <= snap_radius).then_some(q)
     }
 
@@ -661,6 +700,17 @@ impl DrawingAssistant for PerspectiveAssistant {
                 continue;
             }
             if let Some([a, b]) = clip_ray(vp, d, viewport) {
+                let (a, b) = match self.ray_len() {
+                    None => (a, b),
+                    Some(len) => {
+                        let t = |p: [f64; 2]| (p[0] - vp[0]) * d[0] + (p[1] - vp[1]) * d[1];
+                        let (lo, hi) = (t(a).max(0.0).min(len), t(b).max(0.0).min(len));
+                        if hi <= lo + 1e-9 {
+                            continue;
+                        }
+                        ([vp[0] + d[0] * lo, vp[1] + d[1] * lo], [vp[0] + d[0] * hi, vp[1] + d[1] * hi])
+                    }
+                };
                 out.push(GuidePrimitive::Segment { a, b, major: false });
             }
         }
@@ -723,13 +773,29 @@ impl DrawingAssistant for ParallelAssistant {
         let s = (point[0] - self.anchor[0]) * n[0] + (point[1] - self.anchor[1]) * n[1];
         let k = (s / self.spacing).round();
         let off = s - k * self.spacing;
+        if let Some(half) = self.half() {
+            let c = [self.anchor[0] + n[0] * k * self.spacing, self.anchor[1] + n[1] * k * self.spacing];
+            let t = (point[0] - c[0]) * d[0] + (point[1] - c[1]) * d[1];
+            if t.abs() > half {
+                return None;
+            }
+        }
         (off.abs() <= snap_radius).then(|| [point[0] - n[0] * off, point[1] - n[1] * off]).filter(|q| finite2(*q))
     }
 
     fn overlay_primitives(&self, viewport: [f64; 4]) -> Vec<GuidePrimitive> {
         let mut out = Vec::new();
         let Some(d) = self.direction() else { return out };
-        if let Some([a, b]) = clip_line(self.anchor, d, viewport) {
+        // One segment per family line: finite around its center when `length` is set,
+        // else clipped to the viewport like the legacy infinite ruler.
+        let seg = |c: [f64; 2]| -> Option<[[f64; 2]; 2]> {
+            if let Some(half) = self.half() {
+                Some([[c[0] - d[0] * half, c[1] - d[1] * half], [c[0] + d[0] * half, c[1] + d[1] * half]])
+            } else {
+                clip_line(c, d, viewport)
+            }
+        };
+        if let Some([a, b]) = seg(self.anchor) {
             out.push(GuidePrimitive::Segment { a, b, major: true });
         }
         // Family lines covering the viewport, strided so a dense comb stays bounded.
@@ -755,7 +821,7 @@ impl DrawingAssistant for ParallelAssistant {
                     continue;
                 }
                 let a = [self.anchor[0] + n[0] * k * self.spacing, self.anchor[1] + n[1] * k * self.spacing];
-                if let Some([p, q]) = clip_line(a, d, viewport) {
+                if let Some([p, q]) = seg(a) {
                     out.push(GuidePrimitive::Segment { a: p, b: q, major: false });
                 }
             }
@@ -886,7 +952,7 @@ impl DrawingAssistant for FisheyeAssistant {
             return None;
         }
         let plate = self.backward(point)?;
-        let (q, _) = snap_to_rays(&self.vps, &self.rays, self.horizon_y, plate)?;
+        let (q, _) = snap_to_rays(&self.vps, &self.rays, self.horizon_y, plate, None)?;
         let out = self.forward(q)?;
         let dist = (point[0] - out[0]).hypot(point[1] - out[1]);
         (dist <= snap_radius && finite2(out)).then_some(out)
@@ -1179,10 +1245,10 @@ mod tests {
         assert!(StraightLineAssistant::new([0.0, 0.0], f64::INFINITY).is_none());
         assert!(StraightLineAssistant::new([f64::NAN, 0.0], 0.0).is_none());
         assert!(StraightLineAssistant::new([MAX_COORDINATE + 1.0, 0.0], 0.0).is_none());
-        let bad = StraightLineAssistant { anchor: [f64::NAN, 0.0], angle_deg: 0.0 };
+        let bad = StraightLineAssistant { anchor: [f64::NAN, 0.0], angle_deg: 0.0, length: 0.0 };
         assert_eq!(bad.snap_point([10.0, 0.0], 8.0), None);
         assert!(bad.overlay_primitives([0.0, 0.0, 100.0, 100.0]).is_empty());
-        let bad_angle = StraightLineAssistant { anchor: [0.0, 0.0], angle_deg: f64::NAN };
+        let bad_angle = StraightLineAssistant { anchor: [0.0, 0.0], angle_deg: f64::NAN, length: 0.0 };
         assert_eq!(bad_angle.snap_point([10.0, 0.0], 8.0), None);
         // Non-finite points and radii never snap.
         let a = straight();
@@ -1196,12 +1262,12 @@ mod tests {
         assert!(PerspectiveAssistant::new(vec![], None, vec![]).is_none());
         assert!(PerspectiveAssistant::new(vec![[0.0, 0.0]; MAX_VANISHING_POINTS + 1], None, vec![]).is_none());
         assert!(PerspectiveAssistant::new(vec![[0.0, 0.0]], None, vec![PerspectiveRay { vp: 7, angle_deg: 0.0 }]).is_none());
-        let dangling = PerspectiveAssistant { vps: vec![[50.0, 50.0]], horizon_y: None, rays: vec![PerspectiveRay { vp: 3, angle_deg: 0.0 }] };
+        let dangling = PerspectiveAssistant { vps: vec![[50.0, 50.0]], horizon_y: None, rays: vec![PerspectiveRay { vp: 3, angle_deg: 0.0 }], length: 0.0 };
         assert_eq!(dangling.snap_point([50.0, 53.0], 8.0), None);
         // The dangling ray draws no segment, but the valid vanishing point keeps its handle.
         assert!(dangling.overlay_primitives([0.0, 0.0, 100.0, 100.0]).iter().all(|p| matches!(p, GuidePrimitive::Handle { .. })));
         // Empty perspective (valid shape, no guides) snaps to nothing.
-        let empty = PerspectiveAssistant { vps: vec![[50.0, 50.0]], horizon_y: None, rays: vec![] };
+        let empty = PerspectiveAssistant { vps: vec![[50.0, 50.0]], horizon_y: None, rays: vec![], length: 0.0 };
         assert_eq!(empty.snap_point([50.0, 53.0], 8.0), None);
     }
 

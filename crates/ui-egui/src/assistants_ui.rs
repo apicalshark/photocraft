@@ -235,14 +235,51 @@ fn draw_handle(painter: &egui::Painter, c: Pos2, kind: HandleKind, selected: boo
 
 /// Which slider rows a popup item gets under its row.
 #[derive(Clone, Copy, PartialEq)]
-enum Extras {
-    None,
-    /// Ray-fan density (perspective).
-    Rays,
-    /// Family-line spacing (parallel, concentric).
-    Spacing,
-    /// Ray density plus lens strength (fisheye).
-    Fisheye,
+struct Extras {
+    rays: bool,
+    spacing: bool,
+    strength: bool,
+    length: bool,
+}
+
+/// One fixed-width slider row: label, then an 84 px field. Fixed chrome keeps the popup
+/// from stretching with long translations or big numbers.
+#[allow(clippy::too_many_arguments)]
+fn slider_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    mut value: f64,
+    range: std::ops::RangeInclusive<f64>,
+    speed: f64,
+    suffix: &str,
+    run: &mut Vec<(&str, serde_json::Value)>,
+    id: u64,
+    cmd: &'static str,
+    key: &'static str,
+    coalesce: &'static str,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let h = ui.spacing().interact_size.y;
+        let resp = ui.add_sized(egui::vec2(84.0, h), egui::DragValue::new(&mut value).range(range).speed(speed).suffix(suffix));
+        if resp.changed() {
+            let mut p = json!({"id": id});
+            p[key] = json!(value);
+            p["coalesce"] = json!(coalesce);
+            run.push((cmd, p));
+        }
+    });
+}
+
+/// The popup slider's current guide length, if the kind has one.
+fn length_of(app: &PhotocraftApp, id: u64) -> Option<f64> {
+    let st = app.session.active()?;
+    match &st.doc.assistants.get(AssistantId(id))?.kind {
+        DrawingAssistantKind::StraightLine(l) => Some(l.length),
+        DrawingAssistantKind::Parallel(p) => Some(p.length),
+        DrawingAssistantKind::Perspective(p) => Some(p.length),
+        _ => None,
+    }
 }
 
 /// The popup slider's current spacing for a parallel/concentric item.
@@ -320,6 +357,7 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let resp = crate::brush_picker::named(resp, "Drawing assistants: snap strokes to guides");
     egui::Popup::menu(&resp).show(|ui| {
         ui.set_min_width(240.0);
+        ui.set_max_width(300.0);
         widgets::menu_scroll(ui, |ui| {
             let mut run: Vec<(&str, serde_json::Value)> = Vec::new();
             let (mut enabled, radius) = app
@@ -333,7 +371,9 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 ui.label(tl!("Magnetism"));
                 let mut px = radius;
-                let resp = ui.add(egui::DragValue::new(&mut px).range(0.0..=photocraft_doc::MAX_SNAP_RADIUS).speed(0.5).suffix(" px"));
+                let h = ui.spacing().interact_size.y;
+                let resp =
+                    ui.add_sized(egui::vec2(84.0, h), egui::DragValue::new(&mut px).range(0.0..=photocraft_doc::MAX_SNAP_RADIUS).speed(0.5).suffix(" px"));
                 if resp.changed() {
                     let mut p = json!({"radius": px});
                     p["coalesce"] = json!("assist-radius");
@@ -370,15 +410,16 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         .items
                         .iter()
                         .map(|a| {
+                            let none = Extras { rays: false, spacing: false, strength: false, length: false };
                             let (kind, extras) = match &a.kind {
-                                DrawingAssistantKind::StraightLine(_) => (tl!("Line").to_string(), Extras::None),
-                                DrawingAssistantKind::Perspective(_) => (tl!("Perspective").to_string(), Extras::Rays),
-                                DrawingAssistantKind::Bezier(_) => (tl!("Bezier").to_string(), Extras::None),
-                                DrawingAssistantKind::Parallel(_) => (tl!("Parallel").to_string(), Extras::Spacing),
-                                DrawingAssistantKind::Ellipse(_) => (tl!("Ellipse").to_string(), Extras::None),
-                                DrawingAssistantKind::Concentric(_) => (tl!("Concentric").to_string(), Extras::Spacing),
-                                DrawingAssistantKind::Polygon(_) => (tl!("Polygon").to_string(), Extras::None),
-                                DrawingAssistantKind::Fisheye(_) => (tl!("Fisheye").to_string(), Extras::Fisheye),
+                                DrawingAssistantKind::StraightLine(_) => (tl!("Line").to_string(), Extras { length: true, ..none }),
+                                DrawingAssistantKind::Perspective(_) => (tl!("Perspective").to_string(), Extras { rays: true, length: true, ..none }),
+                                DrawingAssistantKind::Bezier(_) => (tl!("Bezier").to_string(), none),
+                                DrawingAssistantKind::Parallel(_) => (tl!("Parallel").to_string(), Extras { spacing: true, length: true, ..none }),
+                                DrawingAssistantKind::Ellipse(_) => (tl!("Ellipse").to_string(), none),
+                                DrawingAssistantKind::Concentric(_) => (tl!("Concentric").to_string(), Extras { spacing: true, ..none }),
+                                DrawingAssistantKind::Polygon(_) => (tl!("Polygon").to_string(), none),
+                                DrawingAssistantKind::Fisheye(_) => (tl!("Fisheye").to_string(), Extras { rays: true, strength: true, ..none }),
                             };
                             (a.id.0, a.name.clone(), a.visible, a.snapping, a.color, kind, extras)
                         })
@@ -393,6 +434,7 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     color_swatch(app, ui, id, color, &mut run);
                     // Inline rename: click the name for a one-line edit, ↩ commits, Esc cancels.
                     let editing = app.ui.assistant_rename.as_ref().is_some_and(|(eid, _)| *eid == id);
+                    let title = format!("{name} ({kind})");
                     if editing {
                         let draft = app.ui.assistant_rename.as_mut().map(|(_, d)| d).expect("editing");
                         let resp = ui.add(egui::TextEdit::singleline(draft).desired_width(120.0).hint_text(kind.as_str()));
@@ -405,7 +447,7 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             app.ui.assistant_rename = None;
                         }
-                    } else if ui.label(format!("{name} ({kind})")).clicked() {
+                    } else if crate::widgets::elided_label_sensed(ui, title.as_str(), 120.0, egui::Sense::click()).clicked() {
                         app.ui.assistant_rename = Some((id, name.clone()));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -423,53 +465,66 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         }
                     });
                 });
-                // Per-kind sliders under the row: ray density, guide spacing, lens strength.
-                match extras {
-                    Extras::None => {}
-                    Extras::Rays => {
-                        ui.horizontal(|ui| {
-                            ui.label(tl!("Ray step"));
-                            let mut step = ray_step_of(app, id).unwrap_or(15.0);
-                            let resp = ui.add(egui::DragValue::new(&mut step).range(1.0..=180.0).speed(0.5).suffix("°"));
-                            if resp.changed() {
-                                let mut p = json!({"id": id, "rayStep": step});
-                                p["coalesce"] = json!("assist-raystep");
-                                run.push(("assist.setRayStep", p));
-                            }
-                        });
-                    }
-                    Extras::Spacing => {
-                        ui.horizontal(|ui| {
-                            ui.label(tl!("Spacing"));
-                            let mut gap = spacing_of(app, id).unwrap_or(20.0);
-                            let resp = ui.add(egui::DragValue::new(&mut gap).range(1.0..=1000000.0).speed(0.5).suffix(" px"));
-                            if resp.changed() {
-                                let mut p = json!({"id": id, "spacing": gap});
-                                p["coalesce"] = json!("assist-spacing");
-                                run.push(("assist.setSpacing", p));
-                            }
-                        });
-                    }
-                    Extras::Fisheye => {
-                        ui.horizontal(|ui| {
-                            ui.label(tl!("Ray step"));
-                            let mut step = ray_step_of(app, id).unwrap_or(15.0);
-                            let resp = ui.add(egui::DragValue::new(&mut step).range(1.0..=180.0).speed(0.5).suffix("°"));
-                            if resp.changed() {
-                                let mut p = json!({"id": id, "rayStep": step});
-                                p["coalesce"] = json!("assist-raystep");
-                                run.push(("assist.setRayStep", p));
-                            }
-                            ui.label(tl!("Strength"));
-                            let mut k = strength_of(app, id).unwrap_or(0.65);
-                            let resp = ui.add(egui::DragValue::new(&mut k).range(0.0..=1.0).speed(0.01));
-                            if resp.changed() {
-                                let mut p = json!({"id": id, "strength": k});
-                                p["coalesce"] = json!("assist-strength");
-                                run.push(("assist.setFisheyeStrength", p));
-                            }
-                        });
-                    }
+                // Per-kind sliders under the row, fixed widths so the popup never stretches.
+                if extras.rays {
+                    slider_row(
+                        ui,
+                        tl!("Ray step"),
+                        ray_step_of(app, id).unwrap_or(15.0),
+                        1.0..=180.0,
+                        0.5,
+                        "°",
+                        &mut run,
+                        id,
+                        "assist.setRayStep",
+                        "rayStep",
+                        "assist-raystep",
+                    );
+                }
+                if extras.spacing {
+                    slider_row(
+                        ui,
+                        tl!("Spacing"),
+                        spacing_of(app, id).unwrap_or(20.0),
+                        1.0..=1000000.0,
+                        0.5,
+                        " px",
+                        &mut run,
+                        id,
+                        "assist.setSpacing",
+                        "spacing",
+                        "assist-spacing",
+                    );
+                }
+                if extras.strength {
+                    slider_row(
+                        ui,
+                        tl!("Strength"),
+                        strength_of(app, id).unwrap_or(0.65),
+                        0.0..=1.0,
+                        0.01,
+                        "",
+                        &mut run,
+                        id,
+                        "assist.setFisheyeStrength",
+                        "strength",
+                        "assist-strength",
+                    );
+                }
+                if extras.length {
+                    slider_row(
+                        ui,
+                        tl!("Length"),
+                        length_of(app, id).unwrap_or(100.0),
+                        1.0..=1000000.0,
+                        1.0,
+                        " px",
+                        &mut run,
+                        id,
+                        "assist.setLength",
+                        "length",
+                        "assist-length",
+                    );
                 }
             }
             for (id, params) in run {
