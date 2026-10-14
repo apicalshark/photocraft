@@ -292,7 +292,7 @@ fn length_row(ui: &mut egui::Ui, id: u64, value: f64, run: &mut Vec<(&str, serde
 /// Parallel line count: whole lines 1–16.
 fn count_row(ui: &mut egui::Ui, id: u64, value: u32, run: &mut Vec<(&str, serde_json::Value)>) {
     let mut v = value as f32;
-    let resp = widgets::slider_row_prec(ui, "Lines", &mut v, 1.0..=16.0, "", None, widgets::RowGestures::default(), Some(0));
+    let resp = widgets::slider_row_prec(ui, tl!("Lines"), &mut v, 1.0..=16.0, "", None, widgets::RowGestures::default(), Some(0));
     if resp.changed() {
         let mut p = json!({"id": id});
         p["count"] = json!(v.round() as u32);
@@ -395,176 +395,208 @@ fn color_swatch(app: &PhotocraftApp, ui: &mut egui::Ui, id: u64, current: LabelC
     });
 }
 
-/// Options-bar popup: the "Snap to Assistants" switch, magnetism, and assistant management.
+/// Options-bar popup: snap switch, magnetism, and the assistant list.
+///
+/// Fixed 280 px card: the header (switch + magnetism + New dropdown) stays put while
+/// only the assistant list scrolls. Each assistant is one section — header row, snap
+/// row, then its parameter sliders indented — separated by hairlines, never bare
+/// separators. All chrome comes from `widgets`/`Tokens`, like the brush picker.
 pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    const WIDTH: f32 = 280.0;
     let count = app.session.active().map(|st| st.doc.assistants.items.len()).unwrap_or(0);
     let on = app.session.active().is_some_and(|st| st.doc.assistants.enabled);
     let resp = crate::icons::button_with_icon_size(ui, "ruler", 24.0, 14.0, on && count > 0, tl!("Drawing assistants: snap strokes to guides"));
     let resp = crate::brush_picker::named(resp, "Drawing assistants: snap strokes to guides");
     egui::Popup::menu(&resp).show(|ui| {
-        ui.set_min_width(240.0);
-        ui.set_max_width(300.0);
-        widgets::menu_scroll(ui, |ui| {
-            let mut run: Vec<(&str, serde_json::Value)> = Vec::new();
-            let (mut enabled, radius) = app
-                .session
-                .active()
-                .map(|st| (st.doc.assistants.enabled, st.doc.assistants.snap_radius))
-                .unwrap_or((true, photocraft_doc::DEFAULT_SNAP_RADIUS));
-            if ui.checkbox(&mut enabled, tl!("Snap to Assistants")).changed() {
-                run.push(("assist.setSnap", json!({"enabled": enabled})));
+        ui.set_min_width(WIDTH);
+        ui.set_max_width(WIDTH);
+        let mut run: Vec<(&str, serde_json::Value)> = Vec::new();
+        let (mut enabled, radius) = app
+            .session
+            .active()
+            .map(|st| (st.doc.assistants.enabled, st.doc.assistants.snap_radius))
+            .unwrap_or((true, photocraft_doc::DEFAULT_SNAP_RADIUS));
+        // Header: global switch, then magnetism — the brush picker's own chrome.
+        if crate::widgets::checkbox(ui, &mut enabled, tl!("Snap to Assistants")).changed() {
+            run.push(("assist.setSnap", json!({"enabled": enabled})));
+        }
+        {
+            let mut px = radius as f32;
+            let resp = widgets::slider_row(ui, tl!("Magnetism"), &mut px, 0.0..=photocraft_doc::MAX_SNAP_RADIUS as f32, " px", None);
+            if resp.changed() {
+                let mut p = json!({"radius": f64::from(px)});
+                p["coalesce"] = json!("assist-radius");
+                run.push(("assist.setSnap", p));
             }
-            {
-                let mut px = radius as f32;
-                let resp = widgets::slider_row(ui, tl!("Magnetism"), &mut px, 0.0..=photocraft_doc::MAX_SNAP_RADIUS as f32, " px", None);
-                if resp.changed() {
-                    let mut p = json!({"radius": f64::from(px)});
-                    p["coalesce"] = json!("assist-radius");
-                    run.push(("assist.setSnap", p));
-                }
-            }
-            ui.separator();
-            ui.menu_button(tl!("New Assistant"), |ui| {
-                widgets::menu_scroll(ui, |ui| {
-                    for (label, cmd) in [
-                        (tl!("Straight Line"), "assist.addStraightLine"),
-                        (tl!("Perspective"), "assist.addPerspective"),
-                        (tl!("Bezier"), "assist.addBezier"),
-                        (tl!("Parallel"), "assist.addParallel"),
-                        (tl!("Ellipse"), "assist.addEllipse"),
-                        (tl!("Concentric"), "assist.addConcentric"),
-                        (tl!("Polygon"), "assist.addPolygon"),
-                        (tl!("Fisheye"), "assist.addFisheye"),
-                    ] {
-                        if ui.add(egui::Button::selectable(false, label)).clicked() {
+        }
+        widgets::hairline(ui);
+        // New-assistant dropdown: the studio chevron combo, full width, placeholder text.
+        {
+            let kinds: [(&str, &str); 8] = [
+                (tl!("Straight Line"), "assist.addStraightLine"),
+                (tl!("Perspective"), "assist.addPerspective"),
+                (tl!("Bezier"), "assist.addBezier"),
+                (tl!("Parallel"), "assist.addParallel"),
+                (tl!("Ellipse"), "assist.addEllipse"),
+                (tl!("Concentric"), "assist.addConcentric"),
+                (tl!("Polygon"), "assist.addPolygon"),
+                (tl!("Fisheye"), "assist.addFisheye"),
+            ];
+            egui::ComboBox::from_id_salt("assist-new")
+                .selected_text(tl!("New Assistant"))
+                .width(WIDTH - 16.0)
+                .icon(widgets::chevron_icon)
+                .show_ui(ui, |ui| {
+                    for (label, cmd) in kinds {
+                        if ui.selectable_label(false, label).clicked() {
                             run.push((cmd, json!({})));
-                            ui.close();
                         }
                     }
                 });
-            });
-            // (id, name, visible, snapping, color, kind label, extras row).
-            let items: Vec<(u64, String, bool, bool, LabelColor, String, Extras)> = app
-                .session
-                .active()
-                .map(|st| {
-                    st.doc
-                        .assistants
-                        .items
-                        .iter()
-                        .map(|a| {
-                            let none = Extras { rays: false, spacing: false, strength: false, length: false, count: false };
-                            let (kind, extras) = match &a.kind {
-                                DrawingAssistantKind::StraightLine(_) => (tl!("Line").to_string(), Extras { length: true, ..none }),
-                                DrawingAssistantKind::Perspective(_) => (tl!("Perspective").to_string(), Extras { rays: true, length: true, ..none }),
-                                DrawingAssistantKind::Bezier(_) => (tl!("Bezier").to_string(), none),
-                                DrawingAssistantKind::Parallel(_) => (tl!("Parallel").to_string(), Extras { spacing: true, length: true, count: true, ..none }),
-                                DrawingAssistantKind::Ellipse(_) => (tl!("Ellipse").to_string(), none),
-                                DrawingAssistantKind::Concentric(_) => (tl!("Concentric").to_string(), Extras { spacing: true, ..none }),
-                                DrawingAssistantKind::Polygon(_) => (tl!("Polygon").to_string(), none),
-                                DrawingAssistantKind::Fisheye(_) => (tl!("Fisheye").to_string(), Extras { rays: true, strength: true, ..none }),
-                            };
-                            (a.id.0, a.name.clone(), a.visible, a.snapping, a.color, kind, extras)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !items.is_empty() {
-                ui.separator();
-            }
-            for (id, name, visible, snapping, color, kind, extras) in items {
-                ui.horizontal(|ui| {
-                    color_swatch(app, ui, id, color, &mut run);
-                    // Inline rename: click the name for a one-line edit, ↩ commits, Esc cancels.
-                    let editing = app.ui.assistant_rename.as_ref().is_some_and(|(eid, _)| *eid == id);
-                    let title = format!("{name} ({kind})");
-                    if editing {
-                        let draft = app.ui.assistant_rename.as_mut().map(|(_, d)| d).expect("editing");
-                        let resp = ui.add(egui::TextEdit::singleline(draft).desired_width(120.0).hint_text(kind.as_str()));
-                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            let done = app.ui.assistant_rename.take().map(|(_, d)| d).unwrap_or_default();
-                            if !done.trim().is_empty() && done.trim() != name {
-                                run.push(("assist.rename", json!({"id": id, "name": done.trim()})));
+        }
+        widgets::hairline(ui);
+        // (id, name, visible, snapping, color, kind label, extras row).
+        let items: Vec<(u64, String, bool, bool, LabelColor, String, Extras)> = app
+            .session
+            .active()
+            .map(|st| {
+                st.doc
+                    .assistants
+                    .items
+                    .iter()
+                    .map(|a| {
+                        let none = Extras { rays: false, spacing: false, strength: false, length: false, count: false };
+                        let (kind, extras) = match &a.kind {
+                            DrawingAssistantKind::StraightLine(_) => (tl!("Line").to_string(), Extras { length: true, ..none }),
+                            DrawingAssistantKind::Perspective(_) => (tl!("Perspective").to_string(), Extras { rays: true, length: true, ..none }),
+                            DrawingAssistantKind::Bezier(_) => (tl!("Bezier").to_string(), none),
+                            DrawingAssistantKind::Parallel(_) => (tl!("Parallel").to_string(), Extras { spacing: true, length: true, count: true, ..none }),
+                            DrawingAssistantKind::Ellipse(_) => (tl!("Ellipse").to_string(), none),
+                            DrawingAssistantKind::Concentric(_) => (tl!("Concentric").to_string(), Extras { spacing: true, ..none }),
+                            DrawingAssistantKind::Polygon(_) => (tl!("Polygon").to_string(), none),
+                            DrawingAssistantKind::Fisheye(_) => (tl!("Fisheye").to_string(), Extras { rays: true, strength: true, ..none }),
+                        };
+                        (a.id.0, a.name.clone(), a.visible, a.snapping, a.color, kind, extras)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if items.is_empty() {
+            let t = Tokens::get(ui.ctx());
+            ui.label(egui::RichText::new(tl!("No assistants yet — pick a kind above.")).color(t.text_dim).small());
+        } else {
+            widgets::menu_scroll(ui, |ui| {
+                ui.set_min_width(WIDTH - 16.0);
+                let last = items.len() - 1;
+                for (n, (id, name, visible, snapping, color, kind, extras)) in items.into_iter().enumerate() {
+                    // Header row: chip, elided name (click to rename), eye + delete right.
+                    ui.horizontal(|ui| {
+                        color_swatch(app, ui, id, color, &mut run);
+                        let editing = app.ui.assistant_rename.as_ref().is_some_and(|(eid, _)| *eid == id);
+                        if editing {
+                            let draft = app.ui.assistant_rename.as_mut().map(|(_, d)| d).expect("editing");
+                            let resp = ui.add(egui::TextEdit::singleline(draft).desired_width(140.0).hint_text(kind.as_str()));
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                let done = app.ui.assistant_rename.take().map(|(_, d)| d).unwrap_or_default();
+                                if !done.trim().is_empty() && done.trim() != name {
+                                    run.push(("assist.rename", json!({"id": id, "name": done.trim()})));
+                                }
                             }
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                app.ui.assistant_rename = None;
+                            }
+                        } else {
+                            // Name elides; the kind rides beside it as a dim caption.
+                            let t = Tokens::get(ui.ctx());
+                            let resp = crate::widgets::elided_label_sensed(ui, name.as_str(), 130.0, egui::Sense::click());
+                            if resp.clicked() {
+                                app.ui.assistant_rename = Some((id, name.clone()));
+                            }
+                            ui.label(egui::RichText::new(kind.as_str()).color(t.text_dim).small());
                         }
-                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                            app.ui.assistant_rename = None;
-                        }
-                    } else if crate::widgets::elided_label_sensed(ui, title.as_str(), 120.0, egui::Sense::click()).clicked() {
-                        app.ui.assistant_rename = Some((id, name.clone()));
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if crate::icons::button(ui, "trash", 22.0, false, tl!("Delete this assistant")).clicked() {
-                            run.push(("assist.remove", json!({"id": id})));
-                        }
-                        let icon = if visible { "eye" } else { "eye-off" };
-                        if crate::icons::button(ui, icon, 22.0, visible, tl!("Show/hide this assistant")).clicked() {
-                            run.push(("assist.setVisible", json!({"id": id, "visible": !visible})));
-                        }
-                        // Per-assistant snapping: the overlay dims while off, strokes pass through.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if crate::icons::button(ui, "trash", 22.0, false, tl!("Delete this assistant")).clicked() {
+                                run.push(("assist.remove", json!({"id": id})));
+                            }
+                            let icon = if visible { "eye" } else { "eye-off" };
+                            if crate::icons::button(ui, icon, 22.0, visible, tl!("Show/hide this assistant")).clicked() {
+                                run.push(("assist.setVisible", json!({"id": id, "visible": !visible})));
+                            }
+                        });
+                    });
+                    // Snap row: a labelled checkbox, not a bare box — its meaning is visible.
+                    {
                         let mut snap = snapping;
-                        if crate::widgets::checkbox(ui, &mut snap, "").on_hover_text(tl!("Snap strokes to this assistant")).changed() {
+                        if crate::widgets::checkbox(ui, &mut snap, tl!("Snap")).changed() {
                             run.push(("assist.setSnapping", json!({"id": id, "snapping": snap})));
                         }
+                    }
+                    // Per-kind parameters, indented under their assistant.
+                    ui.scope(|ui| {
+                        ui.spacing_mut().indent = 20.0;
+                        ui.indent(format!("assist-extras-{id}"), |ui| {
+                            if extras.rays {
+                                slider_row(
+                                    ui,
+                                    tl!("Ray step"),
+                                    ray_step_of(app, id).unwrap_or(15.0),
+                                    1.0..=180.0,
+                                    "°",
+                                    None,
+                                    &mut run,
+                                    id,
+                                    "assist.setRayStep",
+                                    "rayStep",
+                                    "assist-raystep",
+                                );
+                            }
+                            if extras.spacing {
+                                slider_row(
+                                    ui,
+                                    tl!("Spacing"),
+                                    spacing_of(app, id).unwrap_or(20.0),
+                                    1.0..=500.0,
+                                    " px",
+                                    None,
+                                    &mut run,
+                                    id,
+                                    "assist.setSpacing",
+                                    "spacing",
+                                    "assist-spacing",
+                                );
+                            }
+                            if extras.count {
+                                count_row(ui, id, count_of(app, id).unwrap_or(2), &mut run);
+                            }
+                            if extras.strength {
+                                slider_row(
+                                    ui,
+                                    tl!("Strength"),
+                                    strength_of(app, id).unwrap_or(0.65),
+                                    0.0..=1.0,
+                                    "",
+                                    Some(2),
+                                    &mut run,
+                                    id,
+                                    "assist.setFisheyeStrength",
+                                    "strength",
+                                    "assist-strength",
+                                );
+                            }
+                            if extras.length {
+                                length_row(ui, id, length_of(app, id).unwrap_or(100.0), &mut run);
+                            }
+                        });
                     });
-                });
-                // Per-kind sliders under the row, fixed widths so the popup never stretches.
-                if extras.rays {
-                    slider_row(
-                        ui,
-                        tl!("Ray step"),
-                        ray_step_of(app, id).unwrap_or(15.0),
-                        1.0..=180.0,
-                        "°",
-                        None,
-                        &mut run,
-                        id,
-                        "assist.setRayStep",
-                        "rayStep",
-                        "assist-raystep",
-                    );
+                    if n != last {
+                        widgets::hairline(ui);
+                    }
                 }
-                if extras.spacing {
-                    slider_row(
-                        ui,
-                        tl!("Spacing"),
-                        spacing_of(app, id).unwrap_or(20.0),
-                        1.0..=500.0,
-                        " px",
-                        None,
-                        &mut run,
-                        id,
-                        "assist.setSpacing",
-                        "spacing",
-                        "assist-spacing",
-                    );
-                }
-                if extras.count {
-                    count_row(ui, id, count_of(app, id).unwrap_or(2), &mut run);
-                }
-                if extras.strength {
-                    slider_row(
-                        ui,
-                        tl!("Strength"),
-                        strength_of(app, id).unwrap_or(0.65),
-                        0.0..=1.0,
-                        "",
-                        Some(2),
-                        &mut run,
-                        id,
-                        "assist.setFisheyeStrength",
-                        "strength",
-                        "assist-strength",
-                    );
-                }
-                if extras.length {
-                    length_row(ui, id, length_of(app, id).unwrap_or(100.0), &mut run);
-                }
-            }
-            for (id, params) in run {
-                let _ = app.run(id, params);
-            }
-        });
+            });
+        }
+        for (id, params) in run {
+            let _ = app.run(id, params);
+        }
     });
 }
 
