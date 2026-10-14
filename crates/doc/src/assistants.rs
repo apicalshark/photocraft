@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::next_id;
+use crate::{LabelColor, next_id};
 
 /// Identity of one drawing assistant (see [`DrawingAssistantItem`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -985,7 +985,8 @@ impl DrawingAssistant for DrawingAssistantKind {
 }
 
 /// One assistant on the canvas: an id for the commands, a display name, visibility, whether
-/// its guides snap strokes (off draws the overlay dimmed), and its geometry.
+/// its guides snap strokes (off draws the overlay dimmed), a label colour (`None` uses the
+/// theme's assistant colour), and its geometry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DrawingAssistantItem {
@@ -993,12 +994,13 @@ pub struct DrawingAssistantItem {
     pub name: String,
     pub visible: bool,
     pub snapping: bool,
+    pub color: LabelColor,
     pub kind: DrawingAssistantKind,
 }
 
 impl DrawingAssistantItem {
     pub fn new(name: String, kind: DrawingAssistantKind) -> Self {
-        Self { id: AssistantId::fresh(), name, visible: true, snapping: true, kind }
+        Self { id: AssistantId::fresh(), name, visible: true, snapping: true, color: LabelColor::None, kind }
     }
 }
 
@@ -1009,6 +1011,7 @@ impl Default for DrawingAssistantItem {
             name: String::new(),
             visible: true,
             snapping: true,
+            color: LabelColor::None,
             kind: DrawingAssistantKind::StraightLine(StraightLineAssistant::default()),
         }
     }

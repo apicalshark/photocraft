@@ -8,8 +8,8 @@
 
 use photocraft_doc::assistants::is_valid_snap_radius;
 use photocraft_doc::{
-    AssistantId, BezierAssistant, ConcentricAssistant, DrawingAssistantItem, DrawingAssistantKind, EllipseAssistant, FisheyeAssistant, MAX_ASSISTANTS,
-    MAX_SNAP_RADIUS, ParallelAssistant, PerspectiveAssistant, PolygonAssistant, StraightLineAssistant,
+    AssistantId, BezierAssistant, ConcentricAssistant, DrawingAssistantItem, DrawingAssistantKind, EllipseAssistant, FisheyeAssistant, LabelColor,
+    MAX_ASSISTANTS, MAX_SNAP_RADIUS, ParallelAssistant, PerspectiveAssistant, PolygonAssistant, StraightLineAssistant,
 };
 use photocraft_paint::StrokePoint;
 use serde_json::{Value, json};
@@ -70,7 +70,7 @@ fn item_json(a: &DrawingAssistantItem) -> Value {
                 "rays": f.rays.iter().map(|r| json!({"vp": r.vp, "angleDeg": r.angle_deg})).collect::<Vec<_>>()}),
         ),
     };
-    json!({"id": a.id.0, "name": a.name, "visible": a.visible, "snapping": a.snapping, "kind": kind, "detail": detail})
+    json!({"id": a.id.0, "name": a.name, "visible": a.visible, "snapping": a.snapping, "color": a.color.id(), "kind": kind, "detail": detail})
 }
 
 fn list_json(s: &Session) -> Result<Value> {
@@ -727,6 +727,25 @@ fn set_fisheye_strength(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"id": id.0, "strength": strength}))
 }
 
+/// Recolor one assistant's overlay (its label colour; `"none"` returns it to the theme's
+/// assistant magenta).
+fn set_color(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.setColor";
+    let id = get_mut(s, CMD, p)?;
+    let color = p
+        .get("color")
+        .and_then(Value::as_str)
+        .and_then(LabelColor::from_id)
+        .ok_or_else(|| bad(CMD, "`color` must be a label colour id (\"red\", …, \"none\")"))?;
+    s.edit("Assistant Color", |doc, _| {
+        if let Some(a) = doc.assistants.get_mut(id) {
+            a.color = color;
+        }
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "color": color.id()}))
+}
+
 /// Assistant command specs.
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -968,6 +987,16 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"id":fisheye assistant id,"strength":0–1} — 0 is linear, 1 is full fisheye"##,
             enabled: has_doc,
             run: set_fisheye_strength,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.setColor",
+            label: "Assistant Overlay Color",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":assistant id,"color":label id ("red", …, "none")} — "none" is the theme magenta"##,
+            enabled: has_doc,
+            run: set_color,
             journal: true,
         },
     ]

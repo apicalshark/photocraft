@@ -12,7 +12,7 @@ use crate::{
     widgets,
 };
 use egui::{Pos2, Stroke};
-use photocraft_doc::{AssistantId, DrawingAssistant, DrawingAssistantKind, GuidePrimitive, HandleKind};
+use photocraft_doc::{AssistantId, DrawingAssistant, DrawingAssistantKind, GuidePrimitive, HandleKind, LabelColor};
 use serde_json::json;
 
 /// An assistant handle drag in progress (cleared when the assistant goes away).
@@ -167,11 +167,10 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) ->
 
 /// Canvas overlay: guide segments and drag handles of every visible assistant.
 ///
-/// Major guides (the straight line, the horizon) draw solid; the secondary ray fan draws
-/// dotted. Everything uses the assistants' own theme colour, so rulers never read as paths,
-/// selections or reference guides. Lines stay thin (no halo): the magenta is rare enough in
-/// artwork to read on its own, and halos turned the dotted fan into caterpillars.
-/// Assistants whose own snapping is off draw dimmed: still editable, visibly inert.
+/// All guides draw as thin solid lines in the assistant's own colour (its label colour, or
+/// the theme magenta when unlabelled), so rulers never read as paths, selections or
+/// reference guides. Assistants whose own snapping is off draw dimmed: still editable,
+/// visibly inert.
 pub fn draw(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform) {
     if !shown(app) {
         return;
@@ -186,16 +185,15 @@ pub fn draw(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform) {
     let screen = |p: [f64; 2]| xf.to_screen(p[0] as f32, p[1] as f32);
     let dragging = app.ui.assistant_drag;
     for item in st.doc.assistants.items.iter().filter(|a| a.visible) {
-        let color = if item.snapping { t.assistant } else { t.assistant.gamma_multiply(0.4) };
+        let mut color = t.assistant_color(item.color);
+        if !item.snapping {
+            color = color.gamma_multiply(0.4);
+        }
         for p in item.kind.overlay_primitives(vp) {
             match p {
-                GuidePrimitive::Segment { a, b, major } => {
+                GuidePrimitive::Segment { a, b, .. } => {
                     let (a, b) = (screen(a), screen(b));
-                    if major {
-                        painter.line_segment([a, b], Stroke::new(1.0, color));
-                    } else {
-                        painter.add(egui::Shape::dotted_line(&[a, b], color, 6.0, 1.0));
-                    }
+                    painter.line_segment([a, b], Stroke::new(1.0, color));
                 }
                 GuidePrimitive::Handle { pos, kind } => {
                     let selected = dragging.is_some_and(|d| d.id == item.id.0 && d.handle == kind);
@@ -291,6 +289,29 @@ fn ray_step_of(app: &PhotocraftApp, id: u64) -> Option<f64> {
     best.is_finite().then_some(best)
 }
 
+/// The row's color chip: the assistant's label colour (theme magenta when unlabelled).
+/// Opens the shared label-colour choices, like the Layers panel does.
+fn color_swatch(app: &PhotocraftApp, ui: &mut egui::Ui, id: u64, current: LabelColor, run: &mut Vec<(&str, serde_json::Value)>) {
+    let t = Tokens::get(ui.ctx());
+    let chip = t.assistant_color(current);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+    ui.painter().rect_filled(rect, 2.0, chip);
+    ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
+    let resp = resp.on_hover_text(format!("{}: {}", tl!("Color"), crate::layer_menu_ui::color_name(current)));
+    egui::Popup::menu(&resp).show(|ui| {
+        widgets::menu_scroll(ui, |ui| {
+            ui.set_min_width(150.0);
+            for color in LabelColor::ALL {
+                let (text, checked) = (crate::layer_menu_ui::color_name(color), color == current);
+                if ui.add(egui::Button::selectable(checked, text)).clicked() {
+                    run.push(("assist.setColor", json!({"id": id, "color": color.id()})));
+                    ui.close();
+                }
+            }
+        });
+    });
+}
+
 /// Options-bar popup: the "Snap to Assistants" switch, magnetism, and assistant management.
 pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let count = app.session.active().map(|st| st.doc.assistants.items.len()).unwrap_or(0);
@@ -320,34 +341,27 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 }
             });
             ui.separator();
-            ui.horizontal(|ui| {
-                for (label, cmd) in [
-                    (tl!("Straight Line"), "assist.addStraightLine"),
-                    (tl!("Perspective"), "assist.addPerspective"),
-                    (tl!("Bezier"), "assist.addBezier"),
-                    (tl!("Parallel"), "assist.addParallel"),
-                ] {
-                    if ui.button(label).clicked() {
-                        run.push((cmd, json!({})));
-                        ui.close();
+            ui.menu_button(tl!("New Assistant"), |ui| {
+                widgets::menu_scroll(ui, |ui| {
+                    for (label, cmd) in [
+                        (tl!("Straight Line"), "assist.addStraightLine"),
+                        (tl!("Perspective"), "assist.addPerspective"),
+                        (tl!("Bezier"), "assist.addBezier"),
+                        (tl!("Parallel"), "assist.addParallel"),
+                        (tl!("Ellipse"), "assist.addEllipse"),
+                        (tl!("Concentric"), "assist.addConcentric"),
+                        (tl!("Polygon"), "assist.addPolygon"),
+                        (tl!("Fisheye"), "assist.addFisheye"),
+                    ] {
+                        if ui.add(egui::Button::selectable(false, label)).clicked() {
+                            run.push((cmd, json!({})));
+                            ui.close();
+                        }
                     }
-                }
+                });
             });
-            ui.horizontal(|ui| {
-                for (label, cmd) in [
-                    (tl!("Ellipse"), "assist.addEllipse"),
-                    (tl!("Concentric"), "assist.addConcentric"),
-                    (tl!("Polygon"), "assist.addPolygon"),
-                    (tl!("Fisheye"), "assist.addFisheye"),
-                ] {
-                    if ui.button(label).clicked() {
-                        run.push((cmd, json!({})));
-                        ui.close();
-                    }
-                }
-            });
-            // (id, name, visible, snapping, kind label, extras row).
-            let items: Vec<(u64, String, bool, bool, String, Extras)> = app
+            // (id, name, visible, snapping, color, kind label, extras row).
+            let items: Vec<(u64, String, bool, bool, LabelColor, String, Extras)> = app
                 .session
                 .active()
                 .map(|st| {
@@ -366,7 +380,7 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                                 DrawingAssistantKind::Polygon(_) => (tl!("Polygon").to_string(), Extras::None),
                                 DrawingAssistantKind::Fisheye(_) => (tl!("Fisheye").to_string(), Extras::Fisheye),
                             };
-                            (a.id.0, a.name.clone(), a.visible, a.snapping, kind, extras)
+                            (a.id.0, a.name.clone(), a.visible, a.snapping, a.color, kind, extras)
                         })
                         .collect()
                 })
@@ -374,18 +388,10 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             if !items.is_empty() {
                 ui.separator();
             }
-            for (id, name, visible, snapping, kind, extras) in items {
+            for (id, name, visible, snapping, color, kind, extras) in items {
                 ui.horizontal(|ui| {
-                    let icon = if visible { "eye" } else { "eye-off" };
-                    if crate::icons::button(ui, icon, 22.0, visible, tl!("Show/hide this assistant")).clicked() {
-                        run.push(("assist.setVisible", json!({"id": id, "visible": !visible})));
-                    }
-                    // Per-assistant snapping: the overlay dims while off, strokes pass through.
-                    let mut snap = snapping;
-                    if crate::widgets::checkbox(ui, &mut snap, "").on_hover_text(tl!("Snap strokes to this assistant")).changed() {
-                        run.push(("assist.setSnapping", json!({"id": id, "snapping": snap})));
-                    }
-                    // Inline rename: pencil toggles a one-line edit, ↩ commits, Esc cancels.
+                    color_swatch(app, ui, id, color, &mut run);
+                    // Inline rename: click the name for a one-line edit, ↩ commits, Esc cancels.
                     let editing = app.ui.assistant_rename.as_ref().is_some_and(|(eid, _)| *eid == id);
                     if editing {
                         let draft = app.ui.assistant_rename.as_mut().map(|(_, d)| d).expect("editing");
@@ -399,15 +405,21 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             app.ui.assistant_rename = None;
                         }
-                    } else {
-                        ui.label(format!("{name} ({kind})"));
+                    } else if ui.label(format!("{name} ({kind})")).clicked() {
+                        app.ui.assistant_rename = Some((id, name.clone()));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if crate::icons::button(ui, "trash", 22.0, false, tl!("Delete this assistant")).clicked() {
                             run.push(("assist.remove", json!({"id": id})));
                         }
-                        if crate::icons::button(ui, "pencil", 22.0, false, tl!("Rename this assistant")).clicked() {
-                            app.ui.assistant_rename = Some((id, name.clone()));
+                        let icon = if visible { "eye" } else { "eye-off" };
+                        if crate::icons::button(ui, icon, 22.0, visible, tl!("Show/hide this assistant")).clicked() {
+                            run.push(("assist.setVisible", json!({"id": id, "visible": !visible})));
+                        }
+                        // Per-assistant snapping: the overlay dims while off, strokes pass through.
+                        let mut snap = snapping;
+                        if crate::widgets::checkbox(ui, &mut snap, "").on_hover_text(tl!("Snap strokes to this assistant")).changed() {
+                            run.push(("assist.setSnapping", json!({"id": id, "snapping": snap})));
                         }
                     });
                 });

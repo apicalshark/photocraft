@@ -799,6 +799,21 @@ impl Tokens {
         if label == photocraft_doc::LabelColor::None { self.icon } else { Color32::from_gray(226) }
     }
 
+    /// A drawing assistant's overlay colour: its label colour, or the theme's own assistant
+    /// magenta when unlabelled. Bright swatch on dark themes, deep eye colour on light ones.
+    pub fn assistant_color(&self, label: photocraft_doc::LabelColor) -> Color32 {
+        match self.layer_label_colors(label) {
+            None => self.assistant,
+            Some((swatch, eye)) => {
+                if self.dark() {
+                    swatch
+                } else {
+                    eye
+                }
+            }
+        }
+    }
+
     /// Analysis colours are semantic hues, independent of the application accent palette.
     pub fn scope_hue(&self, h: f32, s: f32) -> Color32 {
         let v = f32::from(self.histogram_level) / 255.0;

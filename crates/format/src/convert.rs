@@ -682,6 +682,7 @@ impl Loader<'_> {
                     name: a.name.clone(),
                     visible: a.visible,
                     snapping: a.snapping,
+                    color: a.color,
                     kind: a.kind.clone(),
                 })
                 .collect(),
