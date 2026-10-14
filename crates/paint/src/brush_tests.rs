@@ -759,6 +759,393 @@ fn smoothing_modes() {
 }
 
 #[test]
+fn stabilizer_fields_default_to_todays_law_and_old_json_loads_unchanged() {
+    // Old brush JSON (before the stabilizer fields) must deserialize to the
+    // current law: exponential mode, MA window parked, pressure/pose off.
+    let old: Smoothing = serde_json::from_value(serde_json::json!({
+        "enabled": true, "amount": 0.6, "pulledString": false,
+        "catchUp": true, "catchUpOnEnd": true, "adjustForZoom": true,
+    }))
+    .expect("old brush JSON loads");
+    assert_eq!((old.position_mode, old.position_window), (2, 7));
+    assert_eq!((old.pressure_smoothing, old.pressure_mode), (0, 2));
+    assert_eq!(old.orientation_smoothing, 0.0);
+    // Unknown future keys stay ignored, hostile numbers load without panic
+    // (clamping happens at dispatch, a later change). NaN is unrepresentable
+    // in JSON, so hostility here means absurd magnitudes and unknown modes.
+    let hostile: Smoothing = serde_json::from_value(serde_json::json!({
+        "amount": 0.6, "positionMode": 9, "positionWindow": 999,
+        "pressureSmoothing": 999, "pressureMode": 9, "orientationSmoothing": 1e30,
+        "someFutureKey": [1, 2, 3],
+    }))
+    .expect("hostile brush JSON loads");
+    assert_eq!(hostile.position_mode, 9);
+    // Byte-identical behaviour: the new defaults flow through the old code
+    // paths, so old configs smooth exactly as before.
+    let zig: Vec<StrokePoint> = (0..40).map(|i| StrokePoint::new(i as f64 * 5.0, if i % 2 == 0 { 0.0 } else { 6.0 }, 1.0)).collect();
+    for cfg in [
+        Smoothing { amount: 0.6, ..Default::default() },
+        Smoothing {
+            amount: 0.6,
+            position_mode: 2,
+            position_window: 7,
+            pressure_smoothing: 0,
+            pressure_mode: 2,
+            orientation_smoothing: 0.0,
+            ..Default::default()
+        },
+    ] {
+        let sm = smooth_points(&cfg, 1.0, &zig);
+        let sm_old = smooth_points(&old, 1.0, &zig);
+        assert_eq!(sm.len(), sm_old.len());
+        for (a, b) in sm.iter().zip(sm_old.iter()) {
+            assert!((a.x - b.x).abs() + (a.y - b.y).abs() < 1e-12);
+        }
+    }
+}
+
+#[test]
+fn stabilizer_mode_0_matches_the_pulled_string_flag() {
+    let pts = vec![StrokePoint::new(0.0, 0.0, 1.0), StrokePoint::new(100.0, 0.0, 1.0)];
+    let via_flag = smooth_points(&Smoothing { amount: 0.2, pulled_string: true, ..Default::default() }, 1.0, &pts);
+    let via_mode = smooth_points(
+        &Smoothing { amount: 0.2, pulled_string: false, position_mode: 0, ..Default::default() },
+        1.0,
+        &pts,
+    );
+    assert_eq!(via_flag.len(), via_mode.len());
+    for (a, b) in via_flag.iter().zip(via_mode.iter()) {
+        assert!((a.x - b.x).abs() + (a.y - b.y).abs() < 1e-12);
+    }
+}
+
+#[test]
+fn stabilizer_mode_1_means_the_last_n_inputs() {
+    let cfg = Smoothing { amount: 0.6, position_mode: 1, position_window: 3, ..Default::default() };
+    let pts: Vec<StrokePoint> =
+        [0.0, 3.0, 6.0, 9.0].iter().map(|&x| StrokePoint::new(x, 0.0, 1.0)).collect();
+    let sm = smooth_points(&cfg, 1.0, &pts);
+    // First point seeds; then mean(0,3)=1.5, mean(0,3,6)=3, mean(3,6,9)=6,
+    // plus the catch-up-on-end snap to the last pointer (9.0).
+    let xs: Vec<f64> = sm.iter().map(|p| p.x).collect();
+    assert_eq!(xs.len(), 5);
+    for (got, want) in xs.iter().zip([0.0, 1.5, 3.0, 6.0, 9.0]) {
+        assert!((got - want).abs() < 1e-9, "{xs:?}");
+    }
+    // It smooths: the zig-zag deviation shrinks.
+    let zig: Vec<StrokePoint> = (0..40).map(|i| StrokePoint::new(i as f64 * 5.0, if i % 2 == 0 { 0.0 } else { 6.0 }, 1.0)).collect();
+    let dev = |ps: &[StrokePoint]| ps.iter().map(|p| (p.y - 3.0).abs()).sum::<f64>() / ps.len() as f64;
+    let sm = smooth_points(&cfg, 1.0, &zig);
+    assert!(dev(&sm) < dev(&zig) * 0.6, "{} vs {}", dev(&sm), dev(&zig));
+}
+
+#[test]
+fn stabilizer_windowed_modes_are_chunk_equivalent() {
+    let pts: Vec<StrokePoint> =
+        (0..12).map(|i| StrokePoint::new(i as f64 * 7.0, if i % 2 == 0 { 0.0 } else { 5.0 }, 1.0)).collect();
+    for cfg in [
+        Smoothing { amount: 0.6, position_mode: 1, position_window: 5, ..Default::default() },
+        Smoothing { amount: 0.6, position_mode: 3, ..Default::default() },
+    ] {
+        let feed = |xs: &[StrokePoint]| {
+            let mut s = Smoother::new(&cfg, 1.0);
+            let mut o = Vec::new();
+            for p in xs {
+                s.push(*p, &mut o);
+            }
+            let mut f = Vec::new();
+            s.finish(&mut f);
+            (o, f)
+        };
+        let (whole, whole_fin) = feed(&pts);
+        let (mut split, _) = feed(&pts[..5]);
+        let (tail, tail_fin) = {
+            let mut s = Smoother::new(&cfg, 1.0);
+            let mut o = Vec::new();
+            for p in &pts[..5] {
+                s.push(*p, &mut o);
+            }
+            let mut t = Vec::new();
+            for p in &pts[5..] {
+                s.push(*p, &mut t);
+            }
+            let mut f = Vec::new();
+            s.finish(&mut f);
+            (t, f)
+        };
+        split.extend(tail);
+        assert_eq!(split.len(), whole.len(), "mode {}", cfg.position_mode);
+        for (a, b) in split.iter().zip(whole.iter()) {
+            assert!((a.x - b.x).abs() + (a.y - b.y).abs() < 1e-12, "mode {}", cfg.position_mode);
+        }
+        assert_eq!(tail_fin.len(), whole_fin.len(), "mode {} finish", cfg.position_mode);
+    }
+}
+
+#[test]
+fn stabilizer_mode_3_spring_moves_without_snapping() {
+    let cfg = Smoothing { amount: 0.6, position_mode: 3, ..Default::default() };
+    let pts = vec![StrokePoint::new(0.0, 0.0, 1.0), StrokePoint::new(30.0, 0.0, 1.0)];
+    let sm = smooth_points(&cfg, 1.0, &pts);
+    // v = (30 / 30) * 0.8 = 0.8: moves a little, far from snapping.
+    assert_eq!(sm.len(), 2, "no end snap: {sm:?}");
+    assert!((sm[1].x - 0.8).abs() < 1e-9, "{sm:?}");
+    assert!(!Smoother::new(&cfg, 1.0).lagging());
+}
+
+#[test]
+fn stabilizer_hostile_modes_fall_back_to_exponential() {
+    let pts: Vec<StrokePoint> =
+        (0..10).map(|i| StrokePoint::new(i as f64 * 9.0, if i % 2 == 0 { 0.0 } else { 4.0 }, 1.0)).collect();
+    let exp = smooth_points(&Smoothing { amount: 0.6, position_mode: 2, ..Default::default() }, 1.0, &pts);
+    for mode in [9u8, 255] {
+        let got = smooth_points(&Smoothing { amount: 0.6, position_mode: mode, ..Default::default() }, 1.0, &pts);
+        assert_eq!(got.len(), exp.len(), "mode {mode}");
+        for (a, b) in got.iter().zip(exp.iter()) {
+            assert!((a.x - b.x).abs() + (a.y - b.y).abs() < 1e-12, "mode {mode}");
+        }
+    }
+    // Hostile windows clamp, never panic: 0 behaves like 1, huge behaves like 32.
+    let w0 = smooth_points(&Smoothing { amount: 0.6, position_mode: 1, position_window: 0, ..Default::default() }, 1.0, &pts);
+    let w1 = smooth_points(&Smoothing { amount: 0.6, position_mode: 1, position_window: 1, ..Default::default() }, 1.0, &pts);
+    assert_eq!(w0.len(), w1.len());
+    let wbig = smooth_points(
+        &Smoothing { amount: 0.6, position_mode: 1, position_window: 999, ..Default::default() },
+        1.0,
+        &pts,
+    );
+    let w32 = smooth_points(&Smoothing { amount: 0.6, position_mode: 1, position_window: 32, ..Default::default() }, 1.0, &pts);
+    assert_eq!(wbig.len(), w32.len());
+}
+
+#[test]
+fn stabilizer_pressure_window_off_is_identity() {
+    let pts: Vec<StrokePoint> =
+        [0.5, 0.9, 0.2, 0.0, 0.7].iter().map(|&q| StrokePoint::new(0.0, 0.0, q)).collect();
+    // Windowed laws plus the hostile fallback pass the curve (identity at
+    // defaults) through; mode 0 is a fixed value by design, tested below.
+    for mode in [1u8, 2, 3, 9] {
+        let cfg = Smoothing { amount: 0.6, pressure_smoothing: 0, pressure_mode: mode, ..Default::default() };
+        let sm = smooth_points(&cfg, 1.0, &pts);
+        for (a, b) in sm.iter().zip(pts.iter()) {
+            assert!((a.pressure - b.pressure).abs() < 1e-12, "mode {mode}");
+        }
+    }
+    // Disabled smoothing ignores the window too.
+    let cfg = Smoothing { enabled: false, amount: 0.8, pressure_smoothing: 4, ..Default::default() };
+    let sm = smooth_points(&cfg, 1.0, &pts);
+    for (a, b) in sm.iter().zip(pts.iter()) {
+        assert!((a.pressure - b.pressure).abs() < 1e-12);
+    }
+}
+
+#[test]
+fn stabilizer_pressure_modes() {
+    let ps: Vec<StrokePoint> =
+        [0.5, 0.7, 0.6, 0.9].iter().map(|&q| StrokePoint::new(q * 10.0, 0.0, q as f32)).collect();
+    let pres = |cfg: &Smoothing| smooth_points(cfg, 1.0, &ps).iter().map(|p| p.pressure).collect::<Vec<_>>();
+    // Fixed outputs the configured value.
+    let got = pres(&Smoothing {
+        amount: 0.6,
+        pressure_smoothing: 4,
+        pressure_mode: 0,
+        pressure_fixed_value: 0.4,
+        ..Default::default()
+    });
+    assert!(got.iter().take(4).all(|&q| (q - 0.4).abs() < 1e-9), "{got:?}");
+    // Hold the 3rd sample: earlier ones pass through, then it latches.
+    let got = pres(&Smoothing {
+        amount: 0.6,
+        pressure_smoothing: 4,
+        pressure_mode: 1,
+        pressure_sample_hold: 3,
+        ..Default::default()
+    });
+    for (g, want) in got.iter().zip([0.5, 0.7, 0.6, 0.6]) {
+        assert!((g - want).abs() < 1e-9, "{got:?}");
+    }
+    // Moving average over the last 3: 0.5, 0.6, 0.6, (0.7+0.6+0.9)/3.
+    let got = pres(&Smoothing { amount: 0.6, pressure_smoothing: 3, pressure_mode: 2, ..Default::default() });
+    for (g, want) in got.iter().zip([0.5, 0.6, 0.6, 0.7333333]) {
+        assert!((g - want).abs() < 1e-6, "{got:?}");
+    }
+    // Exponential with factor 0.5 (a = 0.5): 0.5, 0.6, 0.6, 0.75.
+    let got = pres(&Smoothing {
+        amount: 0.6,
+        pressure_smoothing: 3,
+        pressure_mode: 3,
+        pressure_smoothing_factor: 0.5,
+        ..Default::default()
+    });
+    for (g, want) in got.iter().zip([0.5, 0.6, 0.6, 0.75]) {
+        assert!((g - want).abs() < 1e-6, "{got:?}");
+    }
+    // Window 1 follows (mode 2); factor 0 follows (mode 3).
+    let got = pres(&Smoothing { amount: 0.6, pressure_smoothing: 1, pressure_mode: 2, ..Default::default() });
+    for (g, want) in got.iter().zip([0.5, 0.7, 0.6, 0.9]) {
+        assert!((g - want).abs() < 1e-6, "{got:?}");
+    }
+    let got = pres(&Smoothing { amount: 0.6, pressure_smoothing: 8, pressure_mode: 3, ..Default::default() });
+    for (g, want) in got.iter().zip([0.5, 0.7, 0.6, 0.9]) {
+        assert!((g - want).abs() < 1e-6, "{got:?}");
+    }
+}
+
+#[test]
+fn stabilizer_pressure_curve() {
+    // Isolate the curve with a pass-through law (mode 1, short stream).
+    let base = Smoothing { amount: 0.6, pressure_mode: 1, ..Default::default() };
+    let one = |cfg: &Smoothing, q: f32| smooth_points(cfg, 1.0, &[StrokePoint::new(0.0, 0.0, q)])[0].pressure;
+    assert!((one(&base, 0.5) - 0.5).abs() < 1e-9, "defaults are identity");
+    let cfg = Smoothing { pressure_gain: 1.5, ..base.clone() };
+    assert!((one(&cfg, 0.5) - 0.75).abs() < 1e-6, "gain multiplies first");
+    let cfg = Smoothing { pressure_softness: -0.4, ..base.clone() };
+    assert!((one(&cfg, 0.25) - 0.4352752).abs() < 1e-6, "pow(p, 0.6)");
+    let cfg = Smoothing { pressure_invert: true, ..base.clone() };
+    assert!((one(&cfg, 0.25) - 0.75).abs() < 1e-6, "mirror around [0, 1]");
+    let cfg = Smoothing { pressure_min: 0.2, pressure_max: 0.8, ..base.clone() };
+    assert!((one(&cfg, 0.1) - 0.2).abs() < 1e-9, "floor");
+    assert!((one(&cfg, 0.9) - 0.8).abs() < 1e-9, "ceiling");
+    // Pen-up stays 0 even under an inverted curve (checked before the curve).
+    let cfg = Smoothing { pressure_invert: true, pressure_smoothing: 4, ..base.clone() };
+    assert_eq!(one(&cfg, 0.0), 0.0);
+}
+
+#[test]
+fn stabilizer_pressure_speed_scale() {
+    // 500 px/s at t = 1000 ms, then 1000 px/s: gains 1.0, then 1.5.
+    let pts = vec![
+        StrokePoint::new(0.0, 0.0, 0.8),
+        StrokePoint { time: 1000.0, ..StrokePoint::new(500.0, 0.0, 0.8) },
+        StrokePoint { time: 2000.0, ..StrokePoint::new(1500.0, 0.0, 0.8) },
+    ];
+    let cfg = Smoothing {
+        amount: 0.6,
+        // MA position law: one output per push, so indices stay readable
+        // (exponential would fan each 1000 ms push out into ~63 sub-steps).
+        position_mode: 1,
+        position_window: 3,
+        pressure_mode: 1,
+        pressure_speed_enabled: true,
+        pressure_slow_gain: 0.5,
+        pressure_fast_gain: 1.5,
+        pressure_fast_speed: 1000.0,
+        ..Default::default()
+    };
+    let got: Vec<f32> = smooth_points(&cfg, 1.0, &pts).iter().map(|p| p.pressure).collect();
+    for (g, want) in got.iter().zip([0.4, 0.8, 1.2]) {
+        assert!((g - want).abs() < 1e-6, "{got:?}");
+    }
+    // Disabled speed scaling ignores velocity; zero fast speed parks at slow.
+    let cfg = Smoothing { pressure_speed_enabled: false, ..cfg.clone() };
+    let got: Vec<f32> = smooth_points(&cfg, 1.0, &pts).iter().map(|p| p.pressure).collect();
+    assert!(got.iter().take(3).all(|&q| (q - 0.8).abs() < 1e-6), "{got:?}");
+    let cfg = Smoothing { pressure_fast_speed: 0.0, ..cfg.clone() };
+    let cfg = Smoothing { pressure_speed_enabled: true, ..cfg };
+    let got: Vec<f32> = smooth_points(&cfg, 1.0, &pts).iter().map(|p| p.pressure).collect();
+    assert!(got.iter().take(3).all(|&q| (q - 0.4).abs() < 1e-6), "{got:?}");
+}
+
+#[test]
+fn stabilizer_pressure_pen_up_restarts_and_hostile_is_sane() {
+    // Pen-up emits 0 and restarts the average: the resumed stroke relearns.
+    let pts: Vec<StrokePoint> =
+        [0.8, 0.8, 0.0, 0.8].iter().map(|&q| StrokePoint::new(0.0, 0.0, q)).collect();
+    let cfg = Smoothing { amount: 0.6, pressure_smoothing: 8, pressure_mode: 2, ..Default::default() };
+    let got: Vec<f32> = smooth_points(&cfg, 1.0, &pts).iter().map(|p| p.pressure).collect();
+    assert_eq!(&got[..4], &[0.8, 0.8, 0.0, 0.8], "{got:?}");
+    // NaN reuses the last sane value, huge clamps through the curve to 1,
+    // negative clamps to 0 (only exact 0 is pen-up) without restarting.
+    let pts = vec![
+        StrokePoint::new(0.0, 0.0, 0.6),
+        StrokePoint::new(1.0, 0.0, f32::NAN),
+        StrokePoint::new(2.0, 0.0, 99.0),
+        StrokePoint::new(3.0, 0.0, -2.0),
+        StrokePoint::new(4.0, 0.0, 0.8),
+    ];
+    let got: Vec<f32> = smooth_points(&cfg, 1.0, &pts).iter().map(|p| p.pressure).collect();
+    assert!((got[0] - 0.6).abs() < 1e-6, "{got:?}");
+    assert!((got[1] - 0.6).abs() < 1e-6, "NaN holds the level: {got:?}");
+    assert!((got[2] - 0.7333333).abs() < 1e-6, "mean(0.6, 0.6, 1.0): {got:?}");
+    assert!((got[3] - 0.55).abs() < 1e-6, "mean(0.6, 0.6, 1.0, 0.0): {got:?}");
+    assert!((got[4] - 0.6).abs() < 1e-6, "no restart, mean(0.6, 0.6, 1.0, 0.0, 0.8): {got:?}");
+    // Chunked feeding matches the whole stream.
+    let pts: Vec<StrokePoint> =
+        (0..10).map(|i| StrokePoint::new(i as f64, 0.0, 0.3 + (i as f32 % 3.0) * 0.2)).collect();
+    let mut s = Smoother::new(&cfg, 1.0);
+    let mut split = Vec::new();
+    for p in &pts[..4] {
+        s.push(*p, &mut split);
+    }
+    for p in &pts[4..] {
+        s.push(*p, &mut split);
+    }
+    let mut f = Vec::new();
+    s.finish(&mut f);
+    let whole = smooth_points(&cfg, 1.0, &pts);
+    assert_eq!(split.len(), whole.len() - f.len());
+    for (a, b) in split.iter().zip(whole.iter()) {
+        assert!((a.pressure - b.pressure).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn stabilizer_orientation_zero_is_identity() {
+    let pts = vec![
+        StrokePoint { tilt_x: 10.0, tilt_y: -5.0, rotation: 300.0, ..StrokePoint::new(0.0, 0.0, 1.0) },
+        StrokePoint { tilt_x: 20.0, tilt_y: 7.0, rotation: 20.0, ..StrokePoint::new(5.0, 0.0, 1.0) },
+    ];
+    for os in [0.0f32, -3.0] {
+        let cfg = Smoothing { amount: 0.6, orientation_smoothing: os, ..Default::default() };
+        let sm = smooth_points(&cfg, 1.0, &pts);
+        for (a, b) in sm.iter().zip(pts.iter()) {
+            assert!((a.tilt_x - b.tilt_x).abs() < 1e-9, "os {os}");
+            assert!((a.tilt_y - b.tilt_y).abs() < 1e-9, "os {os}");
+            assert!((a.rotation - b.rotation).abs() < 1e-9, "os {os}");
+        }
+    }
+    // Disabled smoothing ignores the amount too.
+    let cfg = Smoothing { enabled: false, amount: 0.8, orientation_smoothing: 0.5, ..Default::default() };
+    let sm = smooth_points(&cfg, 1.0, &pts);
+    for (a, b) in sm.iter().zip(pts.iter()) {
+        assert!((a.tilt_x - b.tilt_x).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn stabilizer_orientation_smooths_tilt_and_wraps_rotation() {
+    // Tilt EMA with t = 0.5: seeds 0, then 5, then 7.5.
+    let pts: Vec<StrokePoint> =
+        [0.0, 10.0, 10.0].iter().map(|&q| StrokePoint { tilt_x: q, ..StrokePoint::new(0.0, 0.0, 1.0) }).collect();
+    let cfg = Smoothing { amount: 0.6, orientation_smoothing: 0.5, ..Default::default() };
+    let got: Vec<f32> = smooth_points(&cfg, 1.0, &pts).iter().map(|p| p.tilt_x).collect();
+    for (g, want) in got.iter().zip([0.0, 5.0, 7.5]) {
+        assert!((g - want).abs() < 1e-6, "{got:?}");
+    }
+    // Rotation takes the shortest arc: 350 -> 10 is +20, half of it lands on 0.
+    let pts = vec![
+        StrokePoint { rotation: 350.0, ..StrokePoint::new(0.0, 0.0, 1.0) },
+        StrokePoint { rotation: 10.0, ..StrokePoint::new(5.0, 0.0, 1.0) },
+    ];
+    let got: Vec<f32> = smooth_points(&cfg, 1.0, &pts).iter().map(|p| p.rotation).collect();
+    assert!((got[0] - 350.0).abs() < 1e-4, "{got:?}");
+    assert!(got[1].abs() < 1e-4 || (got[1] - 360.0).abs() < 1e-4, "{got:?}");
+    // Full amount follows the input.
+    let cfg = Smoothing { amount: 0.6, orientation_smoothing: 1.0, ..Default::default() };
+    let got: Vec<f32> = smooth_points(&cfg, 1.0, &pts).iter().map(|p| p.rotation).collect();
+    assert!((got[1] - 10.0).abs() < 1e-4, "{got:?}");
+    // NaN tilt reuses the last state instead of poisoning it.
+    let pts = vec![
+        StrokePoint { tilt_x: 8.0, ..StrokePoint::new(0.0, 0.0, 1.0) },
+        StrokePoint { tilt_x: f32::NAN, ..StrokePoint::new(1.0, 0.0, 1.0) },
+        StrokePoint { tilt_x: 8.0, ..StrokePoint::new(2.0, 0.0, 1.0) },
+    ];
+    let cfg = Smoothing { amount: 0.6, orientation_smoothing: 0.5, ..Default::default() };
+    let got: Vec<f32> = smooth_points(&cfg, 1.0, &pts).iter().map(|p| p.tilt_x).collect();
+    assert!(got.iter().take(3).all(|&q| (q - 8.0).abs() < 1e-6), "{got:?}");
+}
+
+#[test]
 fn disabled_smoothing_keeps_its_settings_and_paints_unsmoothed_at_every_depth() {
     let pts = vec![StrokePoint::new(10.0, 20.0, 1.0), StrokePoint::new(30.0, 8.0, 0.5), StrokePoint::new(50.0, 20.0, 0.8)];
     for pulled_string in [false, true] {

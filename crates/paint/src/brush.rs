@@ -453,11 +453,134 @@ pub struct Smoothing {
     pub catch_up_on_end: bool,
     /// Divide the string length by the view zoom (the command's `zoom` param).
     pub adjust_for_zoom: bool,
+    /// Position law selector (stabilizer work, P0): 0 pulled string, 1 moving
+    /// average, 2 exponential, 3 inertia. Default 2 reproduces today's law, so
+    /// old brush JSON (without this key) behaves byte-identically.
+    #[serde(default = "default_position_mode")]
+    pub position_mode: u8,
+    /// Moving-average window in points (mode 1; clamped to 1..32 when used).
+    /// Default 7 mirrors the common observed window.
+    #[serde(default = "default_position_window")]
+    pub position_window: u32,
+    /// Pressure smoothing window in points; 0 (default) disables the window
+    /// law, so current feel is byte-identical until a later change wires it
+    /// up. The curve below still applies when configured (identity by default).
+    #[serde(default)]
+    pub pressure_smoothing: u32,
+    /// Pressure law selector (stabilizer work, P0): 0 fixed value, 1 hold the
+    /// Nth sample, 2 moving average, 3 exponential. Windowed laws are inert
+    /// while `pressure_smoothing` is 0.
+    #[serde(default = "default_pressure_mode")]
+    pub pressure_mode: u8,
+    /// Pressure curve gain (multiplies first). Observed shipped values 1..1.8;
+    /// 1.0 (default) is identity.
+    #[serde(default = "default_pressure_gain")]
+    pub pressure_gain: f32,
+    /// Pressure curve bend (`pow(p, 1 + softness)`; 0 skips it). Observed
+    /// shipped values -0.4..0; 0.0 (default) is identity.
+    #[serde(default)]
+    pub pressure_softness: f32,
+    /// Mirror the curved pressure around `[pressure_min, pressure_max]`.
+    #[serde(default)]
+    pub pressure_invert: bool,
+    /// Curve output floor. Observed shipped value 0; 0.0 (default).
+    #[serde(default)]
+    pub pressure_min: f32,
+    /// Curve output ceiling. Observed shipped value 1; 1.0 (default).
+    #[serde(default = "default_pressure_max")]
+    pub pressure_max: f32,
+    /// Mode 0 output (clamped to 0..1 at use).
+    #[serde(default)]
+    pub pressure_fixed_value: f32,
+    /// Mode 1 holds this (1-based) sample; earlier samples pass through.
+    /// Observed value 15; 15 (default).
+    #[serde(default = "default_pressure_sample_hold")]
+    pub pressure_sample_hold: u32,
+    /// Mode 3 exponential factor (`a = 1 - factor` per push); 0.0 (default)
+    /// follows the input.
+    #[serde(default)]
+    pub pressure_smoothing_factor: f32,
+    /// Scale pressure by pen speed (slow gain at rest → fast gain at
+    /// `pressure_fast_speed`). Off by default.
+    #[serde(default)]
+    pub pressure_speed_enabled: bool,
+    /// Gain at rest. Observed shipped values 0.33..1; 1.0 (default).
+    #[serde(default = "default_pressure_gain")]
+    pub pressure_slow_gain: f32,
+    /// Gain at `pressure_fast_speed`. Observed shipped values 0.33..2.19;
+    /// 1.0 (default).
+    #[serde(default = "default_pressure_gain")]
+    pub pressure_fast_gain: f32,
+    /// Speed (px/s) at which the fast gain fully applies. Observed shipped
+    /// values 318..564; 500.0 (default).
+    #[serde(default = "default_pressure_fast_speed")]
+    pub pressure_fast_speed: f32,
+    /// Pre-smooth the speed signal (`a = 1 - factor` per push); 0.0
+    /// (default) follows the raw speed. Observed shipped values 0..0.09.
+    #[serde(default)]
+    pub pressure_speed_smoothing: f32,
+    /// Tilt/rotation smoothing amount, 0..1; 0 (default) keeps today's static
+    /// pose override until a later change wires it up.
+    #[serde(default)]
+    pub orientation_smoothing: f32,
+}
+
+fn default_position_mode() -> u8 {
+    2
+}
+
+fn default_position_window() -> u32 {
+    7
+}
+
+fn default_pressure_mode() -> u8 {
+    2
+}
+
+fn default_pressure_gain() -> f32 {
+    1.0
+}
+
+fn default_pressure_max() -> f32 {
+    1.0
+}
+
+fn default_pressure_sample_hold() -> u32 {
+    15
+}
+
+fn default_pressure_fast_speed() -> f32 {
+    500.0
 }
 
 impl Default for Smoothing {
     fn default() -> Self {
-        Self { enabled: true, amount: 0.0, pulled_string: false, catch_up: true, catch_up_on_end: true, adjust_for_zoom: true }
+        Self {
+            enabled: true,
+            amount: 0.0,
+            pulled_string: false,
+            catch_up: true,
+            catch_up_on_end: true,
+            adjust_for_zoom: true,
+            position_mode: default_position_mode(),
+            position_window: default_position_window(),
+            pressure_smoothing: 0,
+            pressure_mode: default_pressure_mode(),
+            pressure_gain: default_pressure_gain(),
+            pressure_softness: 0.0,
+            pressure_invert: false,
+            pressure_min: 0.0,
+            pressure_max: default_pressure_max(),
+            pressure_fixed_value: 0.0,
+            pressure_sample_hold: default_pressure_sample_hold(),
+            pressure_smoothing_factor: 0.0,
+            pressure_speed_enabled: false,
+            pressure_slow_gain: default_pressure_gain(),
+            pressure_fast_gain: default_pressure_gain(),
+            pressure_fast_speed: default_pressure_fast_speed(),
+            pressure_speed_smoothing: 0.0,
+            orientation_smoothing: 0.0,
+        }
     }
 }
 

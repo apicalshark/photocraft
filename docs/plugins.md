@@ -147,7 +147,10 @@ position-dependent filters (gradients, vignettes) are seamless across bands.
 ## Writing a plug-in in Rust
 
 [`examples/plugins/invert-rs`](../examples/plugins/invert-rs) is a complete `no_std` plug-in
-(no allocator, under 1 KiB built). Build it with:
+(no allocator, under 1 KiB built), and
+[`examples/plugins/smooth-lines`](../examples/plugins/smooth-lines) holds the two Stroke Lab
+line-cleanup filters (Smooth Lines + Advanced) with their host-side tests
+(`crates/plugins/tests/smooth_lines.rs`). Build them with:
 
 ```sh
 rustup target add wasm32-unknown-unknown

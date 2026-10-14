@@ -1841,6 +1841,7 @@ fn documents(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     crate::transform_tool::track_steps(app, ui.ctx());
     crate::cas_transform::tick(app, ui.ctx());
     crate::symmetry_ui::track(app, ui.ctx());
+    crate::ellipse_ruler_ui::track(app, ui.ctx());
     let n = app.session.documents().len();
     // Files opening in the background (#210) have tabs before they have documents.
     let opening = !app.jobs.opens.is_empty();
@@ -3526,6 +3527,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         crate::retouch_ui::draw_source_marker(app, &painter, &xf);
         crate::vector_ui::draw_overlay(app, &painter, &xf, &doc);
         crate::symmetry_ui::draw(app, &painter, &xf);
+        crate::ellipse_ruler_ui::draw(app, &painter, &xf);
         crate::analysis_ui::draw_overlay(app, &painter, &xf);
         crate::gradient_ui::draw_overlay(app, &painter, &xf);
         crate::slice_ui::draw_overlay(app, &painter, &xf);
@@ -4432,7 +4434,8 @@ fn draw_transform_controls(app: &mut PhotocraftApp, painter: &egui::Painter, xf:
 
 /// The line from the brush to the pointer while stroke smoothing lags (Pulled String Mode and
 /// Stroke Catch-up, #3479): a dark underlay and a light line stay visible on any pixels, and a dot
-/// marks the brush end.
+/// marks the brush end. A guide circle rings the pointer end through the brush dot
+/// ([`smoothing_guide_circle`]).
 fn draw_smoothing_string(painter: &egui::Painter, xf: &ViewXform, (brush, pointer): ([f64; 2], [f64; 2])) {
     let (a, b) = (xf.to_screen(brush[0] as f32, brush[1] as f32), xf.to_screen(pointer[0] as f32, pointer[1] as f32));
     if a.distance(b) < 2.0 {
@@ -4441,6 +4444,20 @@ fn draw_smoothing_string(painter: &egui::Painter, xf: &ViewXform, (brush, pointe
     painter.line_segment([a, b], Stroke::new(3.0, Color32::from_black_alpha(110)));
     painter.line_segment([a, b], Stroke::new(1.0, Color32::WHITE));
     painter.circle_filled(a, 2.5, Color32::WHITE);
+    if let Some((c, r)) = smoothing_guide_circle(a, b) {
+        painter.circle_stroke(c, r, Stroke::new(3.0, Color32::from_black_alpha(110)));
+        painter.circle_stroke(c, r, Stroke::new(1.0, Color32::WHITE));
+    }
+}
+
+/// Guide circle for a lagging smoother: centred on the pointer (`b`) with the
+/// brush↔pointer lag as its radius, so the ring passes through the brush dot.
+/// Host-defined geometry -- the reference tool only attests a `guideCircle`
+/// toggle, no radius semantics. `None` when the ends coincide on screen
+/// (same 2px rule as the string, so the two never disagree).
+fn smoothing_guide_circle(a: Pos2, b: Pos2) -> Option<(Pos2, f32)> {
+    let r = a.distance(b);
+    (r >= 2.0).then_some((b, r))
 }
 
 fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter, xf: &ViewXform) {
@@ -4694,6 +4711,9 @@ fn tool_move(app: &mut PhotocraftApp, x: f64, y: f64, pressure: f32, mods: egui:
 /// Tool state machine. Shared by mouse input and automation.
 pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) {
     if crate::symmetry_ui::pointer(app, ev, crate::workspace_ui::sticky_mods(app, mods)) {
+        return;
+    }
+    if crate::ellipse_ruler_ui::pointer(app, ev, crate::workspace_ui::sticky_mods(app, mods)) {
         return;
     }
     // An Alt+right-drag armed for this press (`paint_mouse`): taken before anything else can
@@ -5614,6 +5634,13 @@ mod tabs_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn smoothing_guide_circle_rings_the_pointer_through_the_brush() {
+        assert_eq!(smoothing_guide_circle(pos2(10.0, 10.0), pos2(10.0, 10.0)), None);
+        assert_eq!(smoothing_guide_circle(pos2(10.0, 10.0), pos2(11.0, 10.0)), None, "sub-2px agrees with the string");
+        let (c, r) = smoothing_guide_circle(pos2(0.0, 0.0), pos2(30.0, 40.0)).expect("lag");
+        assert_eq!((c, r), (pos2(30.0, 40.0), 50.0));
+    }
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn every_filter_previews_off_the_ui_thread_and_a_newer_value_cancels_the_old() {

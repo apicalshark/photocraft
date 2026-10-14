@@ -43,6 +43,15 @@ pub fn take_log(ctx: &egui::Context) -> Vec<(String, Outcome)> {
 /// (command, shortcut). Edit › Fill… is Shift+F5 and also Shift+Backspace (Shift+Delete on a Mac).
 pub const SECONDARY: &[(&str, &str)] = &[("edit.fill", "Shift+Backspace")];
 
+/// Synthetic command ids for per-preset shortcuts (`brush.presets.setShortcut`
+/// assignments): dispatched to `tools.setBrush` with the preset, the way action
+/// bindings dispatch to `actions.play`.
+pub const PRESET_PICK_PREFIX: &str = "brush.preset.pick.";
+
+pub fn preset_pick_id(name: &str) -> String {
+    format!("{PRESET_PICK_PREFIX}{name}")
+}
+
 /// Every key binding, most modifiers first (so ⇧⌘Z wins over ⌘Z), each key owned by one command:
 /// command and shell shortcuts, then the menu catalogue's for live items without their own,
 /// then Edit › Keyboard Shortcuts assignments to any other menu item. D and X
@@ -90,13 +99,29 @@ pub fn bindings(app: &PhotocraftApp) -> Vec<(String, KeyboardShortcut)> {
     // another id for the same item, or a default the dialog doesn't list.
     let mut candidates: Vec<(&str, Option<&str>)> = actions.chain(ui).chain(engine).chain(catalog).chain(overrides).chain(secondary).collect();
     candidates.sort_by_key(|(id, sc)| !(sc.is_some() && prefs.shortcuts.get(*id).map(String::as_str) == *sc));
+    // Per-preset shortcuts (user bindings, like action bindings): parsed here so an entry
+    // the engine accepted but this UI cannot parse never fires. Dangling names (preset gone)
+    // are skipped. They sit ahead of every static default -- shadowing one is the assigner's
+    // choice -- so static owners of a taken key are dropped from the table.
+    let mut preset: Vec<(String, KeyboardShortcut)> = Vec::new();
+    for (name, sc) in &app.session.tools.preset_shortcuts {
+        if !app.session.tools.presets.iter().any(|p| &p.name == name) {
+            continue;
+        }
+        if let Some(parsed) = parse(sc)
+            && !preset.iter().any(|(_, b)| *b == parsed)
+        {
+            preset.push((preset_pick_id(name), parsed));
+        }
+    }
     let mut all: Vec<(String, KeyboardShortcut)> = Vec::new();
     for (id, sc) in candidates {
         let Some(sc) = sc.and_then(parse) else { continue };
-        if !all.iter().any(|(_, b)| *b == sc) {
+        if !all.iter().any(|(_, b)| *b == sc) && !preset.iter().any(|(_, b)| *b == sc) {
             all.push((id.to_string(), sc));
         }
     }
+    all.extend(preset);
     all.sort_by_key(|(_, sc)| std::cmp::Reverse(sc.modifiers.shift as u8 + sc.modifiers.alt as u8 + sc.modifiers.command as u8));
     all
 }
@@ -311,7 +336,8 @@ fn label(id: &str) -> String {
 /// Run a shortcut's command like its menu item (dialogs included), or say why it can't run.
 pub fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str) {
     let action = id.strip_prefix(crate::actions::SHORTCUT_PREFIX);
-    let command_id = if action.is_some() { "actions.play" } else { id };
+    let preset = id.strip_prefix(PRESET_PICK_PREFIX);
+    let command_id = if action.is_some() { "actions.play" } else if preset.is_some() { "tools.setBrush" } else { id };
     let outcome = if !crate::menus::is_enabled(app, command_id) {
         let why = disabled_reason(app, command_id);
         let template = "{label} is not available: {reason}";
@@ -328,6 +354,8 @@ pub fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str) {
                 crate::actions::report_play(app, &v);
                 if v.get("failed").is_some_and(|f| f.is_object()) { Err(app.ui.status.clone()) } else { Ok(v) }
             })
+        } else if let Some(name) = preset {
+            crate::menus::invoke(app, ctx, "tools.setBrush", json!({"preset": name}))
         } else if crate::adjust_dialog::has_dialog(id) {
             crate::adjust_dialog::open(app, id);
             Ok(serde_json::Value::Null)

@@ -16,6 +16,7 @@ photocraft-geom = { path = "crates/geom" }
 photocraft-color = { path = "crates/color" }
 photocraft-cms = { path = "crates/cms" }
 photocraft-raster = { path = "crates/raster" }
+photocraft-stroke = { path = "crates/stroke" }
 photocraft-doc = { path = "crates/doc" }
 photocraft-ops = { path = "crates/ops" }
 photocraft-psd = { path = "crates/psd" }

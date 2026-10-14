@@ -9,7 +9,7 @@ use egui_kittest::kittest::Queryable;
 use photocraft_doc::LayerContent;
 use serde_json::json;
 
-use super::{Focus, Outcome, bindings, set_dry_run, take_log};
+use super::{Focus, Outcome, bindings, dispatch, preset_pick_id, set_dry_run, take_log};
 use crate::PhotocraftApp;
 use crate::shortcuts::parse;
 use crate::state::Tool;
@@ -699,4 +699,33 @@ fn type_size_keys_follow_key_position_and_the_typed_selection() {
     positional(&mut h, egui::Key::Semicolon, egui::Key::Comma);
     assert_eq!(logged(&h), ["type.decreaseSize"]);
     assert_eq!(sizes(&h), [(2, base), (3, base + 2.0)], "only the selected \"He\" shrinks");
+}
+
+#[test]
+fn preset_shortcuts_bind_and_pick() {
+    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services());
+    app.run("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": "F6"})).unwrap();
+    let f6 = parse("F6").unwrap();
+    let bound: Vec<String> =
+        bindings(&app).into_iter().filter(|(_, sc)| *sc == f6).map(|(id, _)| id).collect();
+    assert_eq!(bound, [preset_pick_id("Chalk")], "one owner for F6");
+    // Clearing unbinds the preset (the key itself keeps its static owner).
+    app.run("brush.presets.setShortcut", json!({"name": "Chalk"})).unwrap();
+    let id = preset_pick_id("Chalk");
+    assert!(bindings(&app).into_iter().all(|(got, _)| got != id));
+    // Dispatch picks the preset: dry run logs, the real run applies.
+    app.run("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": "F6"})).unwrap();
+    let ctx = egui::Context::default();
+    set_dry_run(&ctx, true);
+    dispatch(&mut app, &ctx, &id);
+    let log = take_log(&ctx);
+    assert!(log.iter().any(|(got, o)| got == &id && *o == Outcome::Ran), "{log:?}");
+    set_dry_run(&ctx, false);
+    dispatch(&mut app, &ctx, &id);
+    assert_eq!(app.session.tools.current_preset.as_deref(), Some("Chalk"));
+    // A deleted preset's id fails loudly instead of picking something else.
+    app.run("brush.presets.delete", json!({"name": "Chalk"})).unwrap();
+    dispatch(&mut app, &ctx, &id);
+    let log = take_log(&ctx);
+    assert!(log.iter().any(|(got, o)| got == &id && matches!(o, Outcome::Failed(_))), "{log:?}");
 }

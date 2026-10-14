@@ -317,6 +317,82 @@ fn presets_save_appends_at_the_end_and_update_overwrites_in_place() {
 }
 
 #[test]
+fn presets_revert_restores_the_picked_brush_and_status_reports_drift() {
+    let mut s = session(10, 10);
+    // Nothing picked: no current, unmodified, revert errors.
+    let st = s.execute("brush.presets.status", json!({})).unwrap();
+    assert!(st["current"].is_null());
+    assert_eq!(st["modified"], json!(false));
+    assert!(s.execute("brush.presets.revert", json!({})).is_err());
+    // Picking is clean.
+    s.execute("tools.setBrush", json!({"preset": "Chalk"})).unwrap();
+    let st = s.execute("brush.presets.status", json!({})).unwrap();
+    assert_eq!(st["current"], "Chalk");
+    assert_eq!(st["modified"], json!(false));
+    // A tool edit drifts; revert restores the preset and clears the drift.
+    s.execute("tools.setBrush", json!({"size": 55})).unwrap();
+    assert_eq!(s.execute("brush.presets.status", json!({})).unwrap()["modified"], json!(true));
+    let r = s.execute("brush.presets.revert", json!({})).unwrap();
+    let chalk = s.tools.presets.iter().find(|p| p.name == "Chalk").unwrap().brush.size;
+    assert_eq!(s.tools.brush.size, chalk);
+    assert_eq!(r["size"], json!(chalk));
+    assert_eq!(s.execute("brush.presets.status", json!({})).unwrap()["modified"], json!(false));
+    // An explicit name re-picks that preset instead of the current one.
+    s.execute("brush.presets.save", json!({"name": "Mine", "brush": {"size": 9}})).unwrap();
+    s.execute("brush.presets.revert", json!({"name": "Mine"})).unwrap();
+    assert_eq!(s.tools.current_preset.as_deref(), Some("Mine"));
+    assert_eq!(s.tools.brush.size, 9.0);
+    // Hostile input errors, never panics; status tolerates anything.
+    assert!(s.execute("brush.presets.revert", json!({"name": "Nope"})).is_err());
+    assert!(s.execute("brush.presets.revert", json!({"name": 42})).is_err());
+    assert!(s.execute("brush.presets.status", json!({"anything": true})).is_ok());
+    // Deleting the current preset clears it: status goes null, revert errors.
+    s.execute("brush.presets.delete", json!({"name": "Mine"})).unwrap();
+    let st = s.execute("brush.presets.status", json!({})).unwrap();
+    assert!(st["current"].is_null());
+    assert!(s.execute("brush.presets.revert", json!({})).is_err());
+}
+
+#[test]
+fn presets_set_shortcut_assigns_clears_moves_and_follows_renames() {
+    let mut s = session(10, 10);
+    // Assign, then clear by the three spellings.
+    let r = s.execute("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": "F6"})).unwrap();
+    assert_eq!(r["name"], json!("Chalk"));
+    assert_eq!(r["shortcut"], json!("F6"));
+    assert_eq!(s.tools.preset_shortcuts.get("Chalk").map(String::as_str), Some("F6"));
+    s.execute("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": ""})).unwrap();
+    assert!(!s.tools.preset_shortcuts.contains_key("Chalk"));
+    s.execute("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": "Ctrl+1"})).unwrap();
+    s.execute("brush.presets.setShortcut", json!({"name": "Chalk"})).unwrap();
+    assert!(!s.tools.preset_shortcuts.contains_key("Chalk"), "missing clears");
+    s.execute("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": "Ctrl+1"})).unwrap();
+    s.execute("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": null})).unwrap();
+    assert!(!s.tools.preset_shortcuts.contains_key("Chalk"), "null clears");
+    // One shortcut picks one preset: assigning a taken key moves it.
+    s.execute("brush.presets.save", json!({"name": "Mine"})).unwrap();
+    s.execute("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": "F6"})).unwrap();
+    s.execute("brush.presets.setShortcut", json!({"name": "Mine", "shortcut": "F6"})).unwrap();
+    assert!(!s.tools.preset_shortcuts.contains_key("Chalk"));
+    assert_eq!(s.tools.preset_shortcuts.get("Mine").map(String::as_str), Some("F6"));
+    // Rename carries the binding; delete drops it.
+    s.execute("brush.presets.rename", json!({"name": "Mine", "newName": "Yours"})).unwrap();
+    assert_eq!(s.tools.preset_shortcuts.get("Yours").map(String::as_str), Some("F6"));
+    s.execute("brush.presets.delete", json!({"name": "Yours"})).unwrap();
+    assert!(s.tools.preset_shortcuts.is_empty());
+    // Hostile input errors, never panics.
+    assert!(s.execute("brush.presets.setShortcut", json!({})).is_err());
+    assert!(s.execute("brush.presets.setShortcut", json!({"name": "Nope", "shortcut": "F6"})).is_err());
+    assert!(s.execute("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": "Ctrl+Ctrl+1"})).is_err());
+    assert!(s.execute("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": "ctrl+1"})).is_err());
+    assert!(s.execute("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": "Ctrl+"})).is_err());
+    assert!(s.execute("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": 42})).is_err());
+    let long = "x".repeat(33);
+    assert!(s.execute("brush.presets.setShortcut", json!({"name": "Chalk", "shortcut": long})).is_err());
+    assert!(s.tools.preset_shortcuts.is_empty(), "rejected assigns store nothing");
+}
+
+#[test]
 fn a_failed_set_brush_leaves_no_current_preset_behind() {
     let mut s = session(10, 10);
     let before = s.tools.brush.clone();
@@ -650,6 +726,51 @@ fn live_stroke_equals_the_commit_at_every_zoom_with_smoothing() {
             }
         }
     }
+}
+
+#[test]
+fn ellipse_ruler_snaps_live_and_commit_to_the_ring() {
+    let mut s = session(64, 64);
+    s.execute("ruler.ellipse.set", json!({"center": [32, 32], "radii": [10, 10]})).unwrap();
+    // Points far off the ring: corners and edges, one live push each.
+    let pts = [[32.0, 0.0], [0.0, 32.0], [32.0, 64.0], [64.0, 32.0], [48.0, 48.0]];
+    let brush = json!({"size": 8, "hardness": 1.0, "smoothing": {"amount": 0}});
+    let p = json!({"points": [[32.0, 0.0]], "brush": brush, "target": "pixels"});
+    let mut live = LiveStroke::begin(&s, &p).unwrap();
+    for q in &pts[1..] {
+        live.push(&[StrokePoint::new(q[0], q[1], 1.0)]).unwrap();
+    }
+    // The committed points ride the ring (radius 10 around the center).
+    let commit = live.into_commit().unwrap();
+    assert_eq!(commit.points.len(), pts.len());
+    for pt in &commit.points {
+        let d = ((pt.x - 32.0).powi(2) + (pt.y - 32.0).powi(2)).sqrt();
+        assert!((d - 10.0).abs() < 1e-6, "({}, {}) rides at {d}", pt.x, pt.y);
+    }
+    // The commit renders exactly what the preview showed.
+    let mut live = LiveStroke::begin(&s, &p).unwrap();
+    for q in &pts[1..] {
+        live.push(&[StrokePoint::new(q[0], q[1], 1.0)]).unwrap();
+    }
+    let seed = live.seed;
+    let shown = live.doc.layer(s.active().unwrap().active_layer.unwrap()).unwrap().surface().unwrap().clone();
+    let mut params = p.clone();
+    params["points"] = pts.iter().map(|q| json!([q[0], q[1]])).collect();
+    params["seed"] = json!(seed);
+    s.execute("paint.stroke", params).unwrap();
+    let done = surface(&s);
+    let mut worst = 0.0f32;
+    for y in 0..64 {
+        for x in 0..64 {
+            let (a, b) = (shown.rgba(x, y), done.rgba(x, y));
+            worst = worst.max((0..4).map(|i| (a[i] - b[i]).abs()).fold(0.0f32, f32::max));
+        }
+    }
+    assert!(worst <= 1.0 / 255.0, "preview differs from the commit by {worst}");
+    assert!(done.rgba(32, 22)[3] > 0.5, "the ring point painted");
+    // Disabled ruler paints the raw points again.
+    s.execute("ruler.disable", json!({})).unwrap();
+    assert_eq!(s.active().unwrap().ruler, None);
 }
 
 #[test]

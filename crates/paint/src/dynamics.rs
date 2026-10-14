@@ -53,20 +53,267 @@ pub struct Smoother {
     zoom: f64,
     pos: Option<StrokePoint>,
     last_input: Option<StrokePoint>,
+    /// Moving-average ring (mode 1): recent input positions, oldest evicted.
+    ma: [(f64, f64); MA_WINDOW_MAX],
+    ma_len: usize,
+    ma_idx: usize,
+    /// Inertia velocity (mode 3): retained push-to-push like the point-stream law.
+    vel: (f64, f64),
+    /// Pressure window (mode 2): recent curved pressures.
+    p_ring: [f32; MA_WINDOW_MAX],
+    p_len: usize,
+    p_idx: usize,
+    /// Mode 1 hold: sample count and the latched pressure.
+    p_count: u32,
+    p_held: Option<f32>,
+    /// Mode 3 exponential state.
+    p_ema: Option<f32>,
+    /// Speed-scale stage: smoothed speed (px/s).
+    p_speed_ema: Option<f32>,
+    /// Last sane curved pressure: hostile (non-finite) samples reuse it.
+    p_last_good: f32,
+    /// Orientation smoothing state: tilt EMA and rotation shortest-arc EMA.
+    o_tilt: Option<(f32, f32)>,
+    o_rot: Option<f32>,
 }
+
+/// Cap for the moving-average window (mirrors the point-stream `MAX_WINDOW`).
+const MA_WINDOW_MAX: usize = 32;
+/// Inertia spring mass (mode 3): fixed default mirroring the point-stream law;
+/// `amount` does not drive this law (a later change may map it).
+const INERTIA_MASS: f64 = 30.0;
+/// Inertia velocity retained per push (mode 3): `1 - drag`, drag 0.2 default.
+const INERTIA_RETAIN: f64 = 0.8;
 
 impl Smoother {
     /// `zoom` is the view zoom (only used with `adjust_for_zoom`).
     pub fn new(cfg: &Smoothing, zoom: f32) -> Self {
-        Self { cfg: cfg.clone(), zoom: f64::from(zoom.max(0.01)), pos: None, last_input: None }
+        Self {
+            cfg: cfg.clone(),
+            zoom: f64::from(zoom.max(0.01)),
+            pos: None,
+            last_input: None,
+            ma: [(0.0, 0.0); MA_WINDOW_MAX],
+            ma_len: 0,
+            ma_idx: 0,
+            vel: (0.0, 0.0),
+            p_ring: [0.0; MA_WINDOW_MAX],
+            p_len: 0,
+            p_idx: 0,
+            p_count: 0,
+            p_held: None,
+            p_ema: None,
+            p_speed_ema: None,
+            p_last_good: 0.0,
+            o_tilt: None,
+            o_rot: None,
+        }
     }
 
     fn active(&self) -> bool {
         self.cfg.enabled && self.cfg.amount > 0.0
     }
 
+    /// Pulled-string law governs when the legacy flag is set or mode 0 is
+    /// selected (both mean the same string; the flag keeps old configs working).
+    fn pulled_law(&self) -> bool {
+        self.cfg.pulled_string || self.cfg.position_mode == 0
+    }
+
+    /// Inertia (mode 3) is fire-and-forget: no catch-up feeding, no end snap
+    /// (mirrors the point-stream law, which never snaps).
+    fn inertia_free(&self) -> bool {
+        !self.pulled_law() && self.cfg.position_mode == 3
+    }
+
+    /// Restart every pressure law (pen-up): stale samples must not leak into
+    /// the resumed stroke.
+    fn p_reset(&mut self) {
+        self.p_len = 0;
+        self.p_idx = 0;
+        self.p_count = 0;
+        self.p_held = None;
+        self.p_ema = None;
+        self.p_speed_ema = None;
+    }
+
+    /// Pressure curve: `gain → pow(1 + softness) → clamp → invert`, mirroring
+    /// the point-stream stage order. Identity at defaults.
+    fn pressure_curve(&self, p: f32) -> f32 {
+        let mut v = p * self.cfg.pressure_gain;
+        if self.cfg.pressure_softness != 0.0 && v > 0.0 && v.is_finite() {
+            v = v.powf(1.0 + self.cfg.pressure_softness);
+        }
+        let (lo, hi) = if self.cfg.pressure_min <= self.cfg.pressure_max {
+            (self.cfg.pressure_min, self.cfg.pressure_max)
+        } else {
+            (self.cfg.pressure_max, self.cfg.pressure_min)
+        };
+        v = v.clamp(lo, hi);
+        if self.cfg.pressure_invert { lo + hi - v } else { v }
+    }
+
+    /// Scale pressure by smoothed pen speed (slow gain at rest, fast gain at
+    /// `pressure_fast_speed`). Identity unless enabled.
+    fn pressure_scale(&mut self, v: f32, speed: f32) -> f32 {
+        if !self.cfg.pressure_speed_enabled {
+            return v;
+        }
+        let speed = if speed.is_finite() { speed.max(0.0) } else { 0.0 };
+        let a = 1.0 - self.cfg.pressure_speed_smoothing.clamp(0.0, 0.95);
+        let sm = match self.p_speed_ema {
+            // Full follow is exact (skips the `e + (s - e)` round-trip dust).
+            Some(e) if a < 1.0 => {
+                let next = e + (speed - e) * a;
+                self.p_speed_ema = Some(next);
+                next
+            }
+            _ => {
+                self.p_speed_ema = Some(speed);
+                speed
+            }
+        };
+        let t = if self.cfg.pressure_fast_speed > 0.0 && self.cfg.pressure_fast_speed.is_finite() {
+            (sm / self.cfg.pressure_fast_speed).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        v * (self.cfg.pressure_slow_gain + (self.cfg.pressure_fast_gain - self.cfg.pressure_slow_gain) * t)
+    }
+
+    /// Full pressure chain: curve → window law → speed scale. With smoothing
+    /// disabled the raw sample passes through. Raw `0` is pen-up (emits 0 and
+    /// restarts every law, before the curve, so an inverted curve can never
+    /// resurrect a lift); non-finite samples reuse the last sane curved value
+    /// and feed it through (cadence-preserving: a dropout holds the level
+    /// instead of stalling the window). Laws: 0 fixed value, 1 hold the Nth
+    /// sample, 2 average the last `pressure_smoothing` samples (inert at 0),
+    /// 3+ per-push exponential (`a = 1 - factor`).
+    fn smooth_pressure(&mut self, pin: f32, speed: f32) -> f32 {
+        if !self.cfg.enabled {
+            return pin;
+        }
+        if pin == 0.0 {
+            self.p_reset();
+            self.p_last_good = 0.0;
+            return 0.0;
+        }
+        let p = if pin.is_finite() { pin.max(0.0) } else { self.p_last_good };
+        let curved = self.pressure_curve(p);
+        self.p_last_good = curved;
+        let processed = match self.cfg.pressure_mode {
+            0 => self.cfg.pressure_fixed_value.clamp(0.0, 1.0),
+            1 => {
+                self.p_count = self.p_count.wrapping_add(1);
+                if self.p_count == self.cfg.pressure_sample_hold.max(1) {
+                    self.p_held = Some(curved);
+                }
+                self.p_held.unwrap_or(curved)
+            }
+            2 if self.cfg.pressure_smoothing > 0 => {
+                let n = self.cfg.pressure_smoothing.clamp(1, MA_WINDOW_MAX as u32) as usize;
+                self.p_ring[self.p_idx % MA_WINDOW_MAX] = curved;
+                self.p_idx = self.p_idx.wrapping_add(1);
+                self.p_len = (self.p_len + 1).min(n);
+                let mut s = 0.0;
+                for i in 0..self.p_len {
+                    s += self.p_ring[(self.p_idx + MA_WINDOW_MAX - 1 - i) % MA_WINDOW_MAX];
+                }
+                s / self.p_len as f32
+            }
+            2 => curved,
+            _ => {
+                let a = 1.0 - self.cfg.pressure_smoothing_factor.clamp(0.0, 0.95);
+                // Full follow is exact (skips the `e + (c - e)` round-trip dust).
+                if a >= 1.0 {
+                    self.p_ema = Some(curved);
+                    return self.pressure_scale(curved, speed);
+                }
+                match self.p_ema {
+                    Some(e) => {
+                        let next = e + (curved - e) * a;
+                        self.p_ema = Some(next);
+                        next
+                    }
+                    None => {
+                        self.p_ema = Some(curved);
+                        curved
+                    }
+                }
+            }
+        };
+        self.pressure_scale(processed, speed)
+    }
+
+    /// Smooth one (tilt_x, tilt_y, rotation) triple. Identity unless smoothing
+    /// is enabled with `orientation_smoothing > 0`: tilt runs a per-push EMA
+    /// and rotation a shortest-arc EMA (both factor `t = clamp(amount)`; 1
+    /// follows the input). Non-finite inputs reuse the last state so hostile
+    /// streams can't poison it. The pose override in `DabGenerator::walk`
+    /// still wins afterwards.
+    fn smooth_orientation(&mut self, tx: f32, ty: f32, rot: f32) -> (f32, f32, f32) {
+        let t = self.cfg.orientation_smoothing.clamp(0.0, 1.0);
+        if !self.cfg.enabled || t <= 0.0 {
+            return (tx, ty, rot);
+        }
+        // Seed with the first sane sample; hostile openers fall back to 0.
+        match self.o_tilt {
+            None => {
+                self.o_tilt =
+                    Some((if tx.is_finite() { tx } else { 0.0 }, if ty.is_finite() { ty } else { 0.0 }));
+            }
+            Some(cur) => {
+                let (mut ax, mut ay) = cur;
+                if tx.is_finite() {
+                    ax += (tx - ax) * t;
+                }
+                if ty.is_finite() {
+                    ay += (ty - ay) * t;
+                }
+                self.o_tilt = Some((ax, ay));
+            }
+        }
+        match self.o_rot {
+            None => {
+                self.o_rot = Some(if rot.is_finite() { rot } else { 0.0 });
+            }
+            Some(cur) => {
+                if rot.is_finite() {
+                    // Shortest arc into -180..180, then normalise to 0..360.
+                    let d = (rot - cur).rem_euclid(360.0);
+                    let arc = if d > 180.0 { d - 360.0 } else { d };
+                    self.o_rot = Some((cur + arc * t).rem_euclid(360.0));
+                }
+            }
+        }
+        match (self.o_tilt, self.o_rot) {
+            (Some((ax, ay)), Some(r)) => (ax, ay, r),
+            _ => (tx, ty, rot),
+        }
+    }
+
     /// Feed one input point; returns the brush positions to paint through.
     pub fn push(&mut self, p: StrokePoint, out: &mut Vec<StrokePoint>) {
+        // Pressure runs through its own chain first (identity at defaults);
+        // the pose override in `DabGenerator::walk` still wins afterwards.
+        // Speed (px/s) feeds the speed-scale stage; timeless or still points
+        // read as stopped.
+        let speed = match self.last_input {
+            Some(q) => {
+                let dt = p.time - q.time;
+                if dt > 0.0 && dt.is_finite() {
+                    let (dx, dy) = (p.x - q.x, p.y - q.y);
+                    let v = (dx * dx + dy * dy).sqrt() / (dt / 1000.0);
+                    if v.is_finite() { v as f32 } else { 0.0 }
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        };
+        let p = StrokePoint { pressure: self.smooth_pressure(p.pressure, speed), ..p };
+        let (tx, ty, rot) = self.smooth_orientation(p.tilt_x, p.tilt_y, p.rotation);
+        let p = StrokePoint { tilt_x: tx, tilt_y: ty, rotation: rot, ..p };
         let prev_input = self.last_input.replace(p);
         if !self.active() {
             out.push(p);
@@ -74,11 +321,18 @@ impl Smoother {
         }
         let Some(pos) = self.pos else {
             self.pos = Some(p);
+            // Seed the windowed laws with the first sample so mode 1 means
+            // over the true input history (matches the point-stream law);
+            // exponential/pulled paths never read this state.
+            self.ma[0] = (p.x, p.y);
+            self.ma_len = 1;
+            self.ma_idx = 1;
+            self.vel = (0.0, 0.0);
             out.push(p);
             return;
         };
         let amount = f64::from(self.cfg.amount.clamp(0.0, 1.0));
-        if self.cfg.pulled_string {
+        if self.pulled_law() {
             let mut len = amount * MAX_STRING_PX;
             if self.cfg.adjust_for_zoom {
                 len /= self.zoom;
@@ -93,16 +347,45 @@ impl Smoother {
             }
             return;
         }
-        // Exponential: every SMOOTHING_STEP_MS of stroke time moves `a` of the way towards the
-        // pointer, so the feel doesn't depend on how often the device reports. Input without
-        // timestamps takes one step per point.
-        let a = 1.0 - amount.min(0.95);
-        let dt = prev_input.map_or(0.0, |q| p.time - q.time);
         let still = prev_input.is_some_and(|q| q.x == p.x && q.y == p.y);
         if still && !self.cfg.catch_up {
             // Without Stroke Catch-Up the brush stops while the pointer pauses (Photoshop).
             return;
         }
+        if self.cfg.position_mode == 1 {
+            // Moving average over the last `position_window` inputs (1..32).
+            let n = self.cfg.position_window.clamp(1, MA_WINDOW_MAX as u32) as usize;
+            self.ma[self.ma_idx % MA_WINDOW_MAX] = (p.x, p.y);
+            self.ma_idx = self.ma_idx.wrapping_add(1);
+            self.ma_len = (self.ma_len + 1).min(n);
+            let (mut sx, mut sy) = (0.0, 0.0);
+            for i in 0..self.ma_len {
+                let q = self.ma[(self.ma_idx + MA_WINDOW_MAX - 1 - i) % MA_WINDOW_MAX];
+                sx += q.0;
+                sy += q.1;
+            }
+            let len = self.ma_len as f64;
+            let np = StrokePoint { x: sx / len, y: sy / len, ..p };
+            self.pos = Some(np);
+            out.push(np);
+            return;
+        }
+        if self.cfg.position_mode == 3 {
+            // Inertia spring over the retained velocity (fixed constants; see above).
+            self.vel.0 = (self.vel.0 + (p.x - pos.x) / INERTIA_MASS) * INERTIA_RETAIN;
+            self.vel.1 = (self.vel.1 + (p.y - pos.y) / INERTIA_MASS) * INERTIA_RETAIN;
+            let np = StrokePoint { x: pos.x + self.vel.0, y: pos.y + self.vel.1, ..p };
+            self.pos = Some(np);
+            out.push(np);
+            return;
+        }
+        // Exponential (mode 2, and any unknown mode, which falls back here so
+        // hostile configs behave like today instead of stalling): every
+        // SMOOTHING_STEP_MS of stroke time moves `a` of the way towards the
+        // pointer, so the feel doesn't depend on how often the device reports. Input without
+        // timestamps takes one step per point.
+        let a = 1.0 - amount.min(0.95);
+        let dt = prev_input.map_or(0.0, |q| p.time - q.time);
         let (iters, step) = if dt > 0.0 && dt.is_finite() {
             let steps = dt / SMOOTHING_STEP_MS;
             let iters = steps.ceil().clamp(1.0, 64.0);
@@ -121,8 +404,10 @@ impl Smoother {
 
     /// Is Stroke Catch-Up still pulling the brush towards a pointer that has stopped? Then the
     /// stroke needs time to keep passing (repeats of the last point) while the pointer is held.
+    /// Inertia never lags (fire-and-forget: nothing left to catch up), and the pulled-string
+    /// law reports through [`Smoother::string`] instead.
     pub fn lagging(&self) -> bool {
-        match (self.active() && self.cfg.catch_up && !self.cfg.pulled_string, self.pos, self.last_input) {
+        match (self.active() && self.cfg.catch_up && !self.inertia_free() && !self.pulled_law(), self.pos, self.last_input) {
             (true, Some(pos), Some(last)) => (pos.x - last.x).abs() + (pos.y - last.y).abs() > 0.01,
             _ => false,
         }
@@ -137,8 +422,10 @@ impl Smoother {
     }
 
     /// End of stroke: with Catch-Up On Stroke End the brush finishes at the last pointer position.
+    /// Inertia is exempt (its spring overshoot is the feel; snapping would yank the endpoint).
+    /// The snap carries the last (already pressure-smoothed) point unchanged.
     pub fn finish(&mut self, out: &mut Vec<StrokePoint>) {
-        if !self.active() || !self.cfg.catch_up_on_end {
+        if !self.active() || !self.cfg.catch_up_on_end || self.inertia_free() {
             return;
         }
         if let (Some(pos), Some(last)) = (self.pos, self.last_input)

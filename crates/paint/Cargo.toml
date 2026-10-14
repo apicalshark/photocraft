@@ -14,4 +14,5 @@ photocraft-raster = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
+photocraft-stroke = { workspace = true }
 serde_json = { workspace = true }

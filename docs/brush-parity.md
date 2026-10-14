@@ -1,6 +1,6 @@
 # Brush and painting parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (Brush Settings minimum fields follow their Control; checkbox-only rows and non-destructive Smoothing switch; shaped-tip cursor follows the view) · **Target:** Adobe Photoshop 2026
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-15 · **Change:** minor (preset revert-to-picked + drift status; Brush Settings minimum fields follow their Control; checkbox-only rows and non-destructive Smoothing switch; shaped-tip cursor follows the view) · **Target:** Adobe Photoshop 2026
 
 Painting is where Photoshop users notice differences first, so it gets its own checklist: the
 brush engine (`crates/paint/src/brush.rs`), the Brush Settings UI
@@ -108,6 +108,7 @@ tablets against Photoshop side by side.
 | .abr import (v1/v2/v6) and export, persistent presets, folders | done | `psd/src/abr.rs` |
 | Brushes panel: drag a folder into a folder | missing | #2014 |
 | Tool presets (.tpl) | partial | Tool Presets panel exists; .tpl import not found |
+| Preset save-back, in-place update, revert-to-picked, drift status | done | `brush.presets.save/update/revert/status` (stabilizer work) |
 | Import 500 brushes without blocking the UI | not run | P24 |
 
 ## Revision history
@@ -119,3 +120,4 @@ tablets against Photoshop side by side.
 | 2026-10-12 | minor | Five Brush Settings switch rows toggle without selecting a properties pane; Smoothing has a default-on switch and retains its settings while disabled (#4283). No brush-feel estimate changed. |
 | 2026-10-12 | minor | A shaped tip's cursor outline turns and flips with a rotated or flipped view, and follows pixel aspect correction |
 | 2026-10-13 | minor | Shape Dynamics and Transfer minimum inputs follow their Control and retain their values while disabled (#3825, partial). No brush-feel estimate changed. |
+| 2026-10-15 | minor | Preset revert-to-picked + drift status (`brush.presets.revert/status`, stabilizer work). No brush-feel estimate changed. |

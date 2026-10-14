@@ -163,6 +163,7 @@ pub mod puppet_ui;
 pub mod quick_pick;
 pub mod rasterize_prompt;
 pub mod retouch_ui;
+pub mod ellipse_ruler_ui;
 mod rgb_histogram;
 pub mod rotate_view;
 pub mod rulers;
@@ -969,6 +970,9 @@ impl PhotocraftApp {
     fn run_command(&mut self, id: &str, params: Value) -> Result<Value, String> {
         if matches!(id, "paint.setSymmetry" | "paint.symmetryFromPath" | "paint.symmetryDisable") {
             self.ui.symmetry_transform = None;
+        }
+        if matches!(id, "ruler.ellipse.set" | "ruler.disable") {
+            self.ui.ruler_drag = None;
         }
         let clip_read = std::mem::take(&mut self.clip_read_for_paste);
         if self.automation_input

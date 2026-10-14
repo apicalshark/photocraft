@@ -259,6 +259,9 @@ fn stroke_with(s: &mut Session, cmd: &str, p: &Value, label: &str, brush: BrushS
     let bg = s.tools.background;
     let fg = brush.color;
     let symmetry = s.active().and_then(|st| st.symmetry.clone());
+    // Same seam as the live preview: the commit replays snapped points, so
+    // the live-commit fast path keeps matching.
+    let pts = crate::ruler_cmds::snap_points(s, pts);
     let (id, brush, zoom) = stroke_target(s, p, brush)?;
     let cmyk = doc_cmyk_space(s);
     // The live stroke the canvas already rendered for exactly these params: take its pixels
@@ -416,6 +419,9 @@ pub struct LiveStroke {
     cmd: String,
     renderer: StrokeRenderer,
     symmetry: Option<crate::symmetry_cmds::PaintingSymmetry>,
+    /// Ellipse ruler at stroke start (like symmetry: mid-stroke changes apply
+    /// to the next stroke). Snaps input points before the smoother.
+    ruler: Option<crate::ruler_cmds::ActiveRuler>,
     mirrors: Vec<StrokeRenderer>,
     mirror_distinct: Vec<bool>,
     /// What the symmetric preview drew last, once a mirror differs from the stroke, and how many
@@ -503,6 +509,7 @@ impl LiveStroke {
         }
         let renderer = StrokeRenderer::new(&brush, Some(surf.format()), zoom);
         let symmetry = s.active().and_then(|st| st.symmetry.clone());
+        let ruler = s.active().and_then(|st| st.ruler.clone());
         let mirrors: Vec<_> = (0..symmetry.as_ref().map_or(0, |s| s.mirror_count())).map(|_| StrokeRenderer::new(&brush, Some(surf.format()), zoom)).collect();
         let mirror_distinct = vec![false; mirrors.len()];
         let pre = surf.clone();
@@ -512,6 +519,7 @@ impl LiveStroke {
             cmd: cmd.into(),
             renderer,
             symmetry,
+            ruler,
             mirrors,
             mirror_distinct,
             union_live: None,
@@ -561,6 +569,16 @@ impl LiveStroke {
     /// Invalid coordinates reject the whole batch without changing the preview.
     pub fn push(&mut self, pts: &[StrokePoint]) -> Result<Rect> {
         check_coords(pts, &self.cmd)?;
+        // The ruler snaps raw input before the smoother (and before `points`,
+        // so the commit replays snapped points).
+        let snapped;
+        let pts = match &self.ruler {
+            Some(r) => {
+                snapped = r.snap_points(pts);
+                &snapped
+            }
+            None => pts,
+        };
         self.points.extend_from_slice(pts);
         let cmyk = self.cmyk.clone();
         photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || {
@@ -787,10 +805,58 @@ fn presets_delete(s: &mut Session, p: &Value) -> Result<Value> {
     if s.tools.current_preset.as_ref().is_some_and(|c| c.eq_ignore_ascii_case(&name)) {
         s.tools.current_preset = None;
     }
+    if let Some(key) = s.tools.preset_shortcuts.keys().find(|k| k.eq_ignore_ascii_case(&name)).cloned() {
+        s.tools.preset_shortcuts.remove(&key);
+    }
     s.brush_presets_changed();
     Ok(json!({ "count": s.tools.presets.len() }))
 }
 
+/// Re-apply the preset the current brush was picked from (the reference's
+/// "discard changes and reload"): the tool brush becomes the preset again,
+/// honoring its captures. Defaults to `current_preset`; an explicit `name`
+/// re-picks that preset instead. Errors when nothing is current or the preset
+/// is gone (a stale current is cleared rather than kept dangling).
+fn presets_revert(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "brush.presets.revert";
+    let name = match p.get("name").filter(|v| !v.is_null()) {
+        Some(_) => name_param(p, cmd)?,
+        None => s.tools.current_preset.clone().ok_or_else(|| bad(cmd, "the current brush was not picked from a preset"))?,
+    };
+    if !s.tools.presets.iter().any(|x| x.name.eq_ignore_ascii_case(&name)) {
+        if s.tools.current_preset.as_ref().is_some_and(|c| c.eq_ignore_ascii_case(&name)) {
+            s.tools.current_preset = None;
+        }
+        return Err(bad(cmd, format!("no brush preset named `{name}`")));
+    }
+    set_brush(s, &json!({ "preset": name }))
+}
+
+/// Whether the tool brush drifted from its preset (the reference's "unsaved
+/// changes" signal): `{current: name?, modified: bool}`. Re-picking rebuilds
+/// the tool brush through `picked_over`, so `modified` compares exactly that
+/// against the tool brush; the transient `color_cmyk` cache is excluded (it
+/// is filled at paint time, not a setting). Never errors: a dangling current
+/// is cleared and reported as no current preset.
+fn presets_status(s: &mut Session, _p: &Value) -> Result<Value> {
+    let current = s.tools.current_preset.clone();
+    match current {
+        Some(name) => match s.tools.presets.iter().find(|x| x.name.eq_ignore_ascii_case(&name)) {
+            Some(pr) => {
+                let mut want = pr.picked_over(&s.tools.brush);
+                want.color_cmyk = None;
+                let mut have = s.tools.brush.clone();
+                have.color_cmyk = None;
+                Ok(json!({ "current": pr.name, "modified": want != have }))
+            }
+            None => {
+                s.tools.current_preset = None;
+                Ok(json!({ "current": Value::Null, "modified": false }))
+            }
+        },
+        None => Ok(json!({ "current": Value::Null, "modified": false })),
+    }
+}
 /// Overwrite an existing preset with the current brush (or the current brush plus a `brush`
 /// patch), in place: no new preset, the position, name and group stay. The preset defaults to the
 /// one the current brush was picked from. A built-in that is updated becomes the user's preset
@@ -824,6 +890,68 @@ fn presets_set_current(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.tools.current_preset = Some(name.clone());
     Ok(json!({ "name": name }))
+}
+
+/// Whether `shortcut` has the shape the UI parses (`shortcuts::parse` rules,
+/// mirrored here so the engine never stores a binding that cannot fire):
+/// optional `Cmd`/`Shift`/`Alt`/`Ctrl` modifiers (each at most once) plus one
+/// non-empty key. Single keys (`F5`) are allowed.
+fn valid_shortcut_shape(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 32 {
+        return false;
+    }
+    let mut parts: Vec<&str> = s.split('+').collect();
+    let key = parts.pop().unwrap_or_default();
+    if key.is_empty() {
+        return false;
+    }
+    let mut mods = 0u8;
+    for m in parts {
+        let bit = match m {
+            "Cmd" => 1,
+            "Shift" => 2,
+            "Alt" => 4,
+            "Ctrl" => 8,
+            _ => return false,
+        };
+        if mods & bit != 0 {
+            return false;
+        }
+        mods |= bit;
+    }
+    true
+}
+
+/// Assign (or clear) the keyboard shortcut that picks a brush preset.
+/// `{"name", "shortcut": text?}`: missing, null or blank clears. One shortcut
+/// picks one preset: assigning a taken shortcut moves it off the old preset.
+/// Session-scoped (not written to the preset store yet); entries the UI
+/// cannot parse never fire. Shadowing a static shortcut is the assigner's
+/// responsibility, as in the reference.
+fn presets_set_shortcut(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "brush.presets.setShortcut";
+    let name = name_param(p, cmd)?;
+    let stored = s.tools.presets.iter().find(|x| x.name.eq_ignore_ascii_case(&name)).ok_or_else(|| bad(cmd, format!("no brush preset named `{name}`")))?.name.clone();
+    match p.get("shortcut").filter(|v| !v.is_null()) {
+        None => {
+            s.tools.preset_shortcuts.remove(&stored);
+            Ok(json!({ "name": stored, "shortcut": Value::Null }))
+        }
+        Some(v) => {
+            let sc = v.as_str().ok_or_else(|| bad(cmd, "shortcut must be a string like \"Ctrl+1\""))?.trim();
+            if sc.is_empty() {
+                s.tools.preset_shortcuts.remove(&stored);
+                return Ok(json!({ "name": stored, "shortcut": Value::Null }));
+            }
+            if !valid_shortcut_shape(sc) {
+                return Err(bad(cmd, "shortcut must look like \"F5\" or \"Ctrl+Shift+1\" (modifiers Cmd/Shift/Alt/Ctrl, each once, plus one key)"));
+            }
+            s.tools.preset_shortcuts.retain(|_, have| *have != sc);
+            s.tools.preset_shortcuts.insert(stored.clone(), sc.to_string());
+            Ok(json!({ "name": stored, "shortcut": sc }))
+        }
+    }
 }
 
 fn has_selection_and_pixels(s: &Session) -> std::result::Result<(), String> {
@@ -1069,8 +1197,32 @@ pub fn specs() -> Vec<CommandSpec> {
             presets_update,
             true
         ),
+        spec!(
+            "brush.presets.revert",
+            "Revert Brush Preset",
+            r##"{"name":string?=the preset the current brush was picked from} → brush JSON (the preset again)"##,
+            always,
+            presets_revert,
+            true
+        ),
+        spec!(
+            "brush.presets.status",
+            "Brush Preset Status",
+            r##"{} → {current:name?, modified:bool (the tool brush drifted from its preset)}"##,
+            always,
+            presets_status,
+            false
+        ),
         spec!("brush.presets.delete", "Delete Brush Preset", r##"{"name":string}"##, always, presets_delete, true),
         spec!("brush.presets.setCurrent", "Set Current Brush Preset", r##"{"name":string}"##, always, presets_set_current, true),
+        spec!(
+            "brush.presets.setShortcut",
+            "Set Brush Preset Shortcut",
+            r##"{"name":string,"shortcut":text?=clears (missing, null or blank)} → {name, shortcut?}"##,
+            always,
+            presets_set_shortcut,
+            true
+        ),
         spec!("brush.defineFromSelection", "Define Brush Preset…", r##"{"name":string}"##, has_selection_and_pixels, define_from_selection, true),
         spec!("brush.get", "Get Brush", "{}", always, |s, _| Ok(brush_json(&s.tools.brush)), false),
         spec!("tools.setBrush", "Set Brush", r##"{"preset":name?,"reset":bool?,…BrushSettings fields (camelCase, deep-merged)}"##, always, set_brush, true),

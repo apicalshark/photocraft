@@ -95,8 +95,10 @@ pub mod rasterize_style_cmds;
 pub mod redeye_cmds;
 pub mod render_cmds;
 pub mod retouch_cmds;
+pub mod ruler_cmds;
 pub mod sample_cmds;
 pub mod sampler_cmds;
+pub mod script_cmds;
 pub mod select_extra_cmds;
 pub mod selection_cmds;
 pub mod slice_cmds;
@@ -207,6 +209,9 @@ pub struct DocState {
     pub isolated_layers: Vec<LayerId>,
     /// Painting symmetry preset or sampled path (tool state, not document pixels).
     pub symmetry: Option<symmetry_cmds::PaintingSymmetry>,
+    /// Ellipse ruler (tool state, not document pixels): input points snap to
+    /// its ring before the smoother, in both the live preview and the commit.
+    pub ruler: Option<ruler_cmds::ActiveRuler>,
     /// Layers panel: layers whose effects list is collapsed under their row (the fx triangle;
     /// view state, not history). Effects lists start open.
     pub fx_collapsed: Vec<LayerId>,
@@ -247,6 +252,7 @@ impl DocState {
             channel_view: Default::default(),
             isolated_layers: Vec::new(),
             symmetry: None,
+            ruler: None,
             fx_collapsed: Vec::new(),
             show_only: None,
             floating: None,
@@ -295,6 +301,10 @@ pub struct ToolState {
     /// preset stays "the current brush" so `brush.presets.update` can overwrite it); cleared when
     /// the brush is reset or the preset is gone.
     pub current_preset: Option<String>,
+    /// Keyboard shortcuts that pick brush presets (`brush.presets.setShortcut`): preset name →
+    /// shortcut text as assigned. Session-scoped (not written to the preset store yet); the UI
+    /// parses each entry and dispatches it to `tools.setBrush`, ahead of the static defaults.
+    pub preset_shortcuts: std::collections::BTreeMap<String, String>,
     /// A layer mask is the edit target ([`ToolState::target_mask`]).
     pub mask_targeted: bool,
     /// The foreground/background pair of the edit target that isn't current: the layer pixels'
@@ -361,6 +371,7 @@ impl Default for ToolState {
             mixer: Default::default(),
             brush_gesture: None,
             current_preset: None,
+            preset_shortcuts: std::collections::BTreeMap::new(),
             mask_targeted: false,
             other_colors: Self::MASK_COLORS,
             cmyk_picks: Vec::new(),

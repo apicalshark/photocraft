@@ -115,6 +115,9 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
     let pr = s.tools.presets.get_mut(i).ok_or_else(|| bad(cmd, "no such preset"))?;
     if pr.name != new {
         let was_current = s.tools.current_preset.as_ref().is_some_and(|c| c.eq_ignore_ascii_case(&pr.name));
+        if let Some(sc) = s.tools.preset_shortcuts.remove(&pr.name) {
+            s.tools.preset_shortcuts.insert(new.clone(), sc);
+        }
         pr.name = new.clone();
         pr.builtin = false;
         if was_current {

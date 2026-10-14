@@ -1,0 +1,3 @@
+# Plain `cargo build` / `cargo clippy` in this directory target WebAssembly; the module has no host build.
+[build]
+target = "wasm32-unknown-unknown"

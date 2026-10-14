@@ -1,0 +1,17 @@
+[package]
+name = "stroke-lab-smooth"
+description = "Stroke Lab: Smooth Lines, a PhotoCraft filter plug-in (ABI v1): post-process line cleanup with three strengths"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+stroke-lab-photocraft = { workspace = true }
