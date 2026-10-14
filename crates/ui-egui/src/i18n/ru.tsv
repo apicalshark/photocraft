@@ -726,6 +726,15 @@
 	Duplicate Layers…	Дублировать слои…
 	Drawing assistants: snap strokes to guides	Ассистенты рисования: привязка мазков к направляющим
 	Snap to Assistants	Привязать к ассистентам
+	Snap strokes to this assistant	Привязать к этому ассистенту
+	Rename this assistant	Переименовать ассистента
+	Ray step	Шаг лучей
+	Bezier	Безье
+	Parallel	Параллель
+	Ellipse	Эллипс
+	Concentric	Концентрические
+	Polygon	Многоугольник
+	Strength	Сила
 	Group name	Имя группы
 	New Group	Новая группа
 	Layer Comp	Вариант слоя

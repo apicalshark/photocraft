@@ -30,9 +30,9 @@ impl AssistantId {
 pub const MAX_COORDINATE: f64 = 1_000_000.0;
 /// How many assistants one document holds (bounds guide-drag hit tests and overlay work).
 pub const MAX_ASSISTANTS: usize = 64;
-/// How many vanishing points one perspective assistant holds (1- and 2-point perspective today,
-/// room for 3-point later).
-pub const MAX_VANISHING_POINTS: usize = 4;
+/// How many vanishing points one perspective assistant holds (up to 6-point compositions
+/// with headroom for auxiliary points).
+pub const MAX_VANISHING_POINTS: usize = 8;
 /// How many explicit rays one perspective assistant holds.
 pub const MAX_RAYS: usize = 360;
 /// Default snapping radius in document pixels (Photoshop-like magnetism at 100 % zoom).
@@ -211,21 +211,382 @@ impl PerspectiveAssistant {
     }
 }
 
-/// The guide geometry of one assistant, extensible without touching the stroke pipeline or the
-/// overlay renderer: Bézier and fisheye kinds (#4408) add variants here plus their trait impls.
+/// A usable guide spacing: finite, positive, and bounded (a planet-sized comb is a mistake).
+fn valid_spacing(s: f64) -> bool {
+    s.is_finite() && s > 0.0 && s <= MAX_COORDINATE
+}
+
+/// Nearest snap of `point` onto explicit perspective rays plus an optional horizon.
+/// Returns the snapped point and its distance; the caller applies the radius.
+fn snap_to_rays(vps: &[[f64; 2]], rays: &[PerspectiveRay], horizon_y: Option<f64>, point: [f64; 2]) -> Option<([f64; 2], f64)> {
+    let mut best: Option<([f64; 2], f64)> = None;
+    let mut consider = |q: [f64; 2], dist: f64| {
+        if finite2(q) && best.is_none_or(|(_, bd)| dist < bd) {
+            best = Some((q, dist));
+        }
+    };
+    for ray in rays {
+        let (Some(vp), Some(d)) = (vps.get(ray.vp).copied(), dir_from_deg(ray.angle_deg)) else { continue };
+        if !in_range(vp) {
+            continue;
+        }
+        let (q, dist) = project(point, vp, d);
+        consider(q, dist);
+    }
+    if let Some(h) = horizon_y.filter(|h| h.is_finite() && h.abs() <= MAX_COORDINATE) {
+        consider([point[0], h], (point[1] - h).abs());
+    }
+    best
+}
+
+/// A cubic Bézier curve ruler through 4 control points: strokes snap onto the curve.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BezierAssistant {
+    pub points: [[f64; 2]; 4],
+}
+
+impl Default for BezierAssistant {
+    fn default() -> Self {
+        Self { points: [[-90.0, 0.0], [-30.0, 0.0], [30.0, 0.0], [90.0, 0.0]] }
+    }
+}
+
+fn bezier_eval(pts: &[[f64; 2]; 4], t: f64) -> [f64; 2] {
+    let (u, t2, u2) = (1.0 - t, t * t, (1.0 - t) * (1.0 - t));
+    [
+        u2 * u * pts[0][0] + 3.0 * u2 * t * pts[1][0] + 3.0 * u * t2 * pts[2][0] + t2 * t * pts[3][0],
+        u2 * u * pts[0][1] + 3.0 * u2 * t * pts[1][1] + 3.0 * u * t2 * pts[2][1] + t2 * t * pts[3][1],
+    ]
+}
+
+fn bezier_deriv(pts: &[[f64; 2]; 4], t: f64) -> [f64; 2] {
+    let u = 1.0 - t;
+    [
+        3.0 * u * u * (pts[1][0] - pts[0][0]) + 6.0 * u * t * (pts[2][0] - pts[1][0]) + 3.0 * t * t * (pts[3][0] - pts[2][0]),
+        3.0 * u * u * (pts[1][1] - pts[0][1]) + 6.0 * u * t * (pts[2][1] - pts[1][1]) + 3.0 * t * t * (pts[3][1] - pts[2][1]),
+    ]
+}
+
+/// Nearest point on the cubic and its distance: coarse sampling plus guarded Newton steps.
+/// Total for any finite input; degenerate (coincident) points still return a best sample.
+fn nearest_on_cubic(pts: &[[f64; 2]; 4], p: [f64; 2]) -> ([f64; 2], f64) {
+    let mut best = (bezier_eval(pts, 0.0), f64::INFINITY);
+    let mut best_t = 0.0;
+    for i in 0..=32 {
+        let t = f64::from(i) / 32.0;
+        let q = bezier_eval(pts, t);
+        let d = (p[0] - q[0]).hypot(p[1] - q[1]);
+        if d < best.1 {
+            best = (q, d);
+            best_t = t;
+        }
+    }
+    let mut t = best_t;
+    for _ in 0..10 {
+        let q = bezier_eval(pts, t);
+        let dv = bezier_deriv(pts, t);
+        let denom = dv[0] * dv[0] + dv[1] * dv[1];
+        if !(denom > 1e-12) {
+            break;
+        }
+        let step = ((q[0] - p[0]) * dv[0] + (q[1] - p[1]) * dv[1]) / denom;
+        if !step.is_finite() {
+            break;
+        }
+        t = (t - step).clamp(0.0, 1.0);
+        let q = bezier_eval(pts, t);
+        let d = (p[0] - q[0]).hypot(p[1] - q[1]);
+        if d < best.1 {
+            best = (q, d);
+        }
+    }
+    best
+}
+
+impl BezierAssistant {
+    /// `None` unless all four control points are in range.
+    pub fn new(points: [[f64; 2]; 4]) -> Option<Self> {
+        points.iter().all(|p| in_range(*p)).then_some(Self { points })
+    }
+}
+
+/// A parallel-line ruler through `anchor` at `angle_deg`: strokes snap onto the nearest of
+/// the infinite family of parallel lines `spacing` apart, anywhere on the canvas.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParallelAssistant {
+    pub anchor: [f64; 2],
+    pub angle_deg: f64,
+    pub spacing: f64,
+}
+
+impl Default for ParallelAssistant {
+    fn default() -> Self {
+        Self { anchor: [0.0, 0.0], angle_deg: 0.0, spacing: 20.0 }
+    }
+}
+
+impl ParallelAssistant {
+    /// `None` for a bad anchor, a non-finite angle, or an unusable spacing.
+    pub fn new(anchor: [f64; 2], angle_deg: f64, spacing: f64) -> Option<Self> {
+        if !in_range(anchor) || dir_from_deg(angle_deg).is_none() || !valid_spacing(spacing) {
+            return None;
+        }
+        Some(Self { anchor, angle_deg, spacing })
+    }
+
+    fn direction(self) -> Option<[f64; 2]> {
+        if !in_range(self.anchor) || !valid_spacing(self.spacing) { None } else { dir_from_deg(self.angle_deg) }
+    }
+}
+
+/// An ellipse ruler: strokes snap onto the rotated ellipse with radii `radii`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EllipseAssistant {
+    pub center: [f64; 2],
+    pub radii: [f64; 2],
+    pub rotation_deg: f64,
+}
+
+impl Default for EllipseAssistant {
+    fn default() -> Self {
+        Self { center: [0.0, 0.0], radii: [60.0, 40.0], rotation_deg: 0.0 }
+    }
+}
+
+impl EllipseAssistant {
+    /// `None` for a bad center, non-positive or unbounded radii, or a non-finite rotation.
+    pub fn new(center: [f64; 2], radii: [f64; 2], rotation_deg: f64) -> Option<Self> {
+        if !in_range(center) || !rotation_deg.is_finite() || radii.iter().any(|r| !r.is_finite() || *r <= 0.0 || *r > MAX_COORDINATE) {
+            return None;
+        }
+        Some(Self { center, radii, rotation_deg })
+    }
+
+    /// Nearest point on the ellipse and its distance: parametric guess plus guarded Newton
+    /// steps in the ellipse's local frame. `None` for degenerate stored geometry.
+    fn nearest(&self, p: [f64; 2]) -> Option<([f64; 2], f64)> {
+        let [rx, ry] = self.radii;
+        if !(rx > 0.0 && ry > 0.0 && rx <= MAX_COORDINATE && ry <= MAX_COORDINATE) || !in_range(self.center) || !self.rotation_deg.is_finite() {
+            return None;
+        }
+        let a = self.rotation_deg.to_radians();
+        let (ca, sa) = (a.cos(), a.sin());
+        // Into the local frame (rotation by -a, translate).
+        let dx = p[0] - self.center[0];
+        let dy = p[1] - self.center[1];
+        let lx = ca * dx + sa * dy;
+        let ly = -sa * dx + ca * dy;
+        let mut t = (ly / ry).atan2(lx / rx);
+        let eval = |t: f64| [rx * t.cos(), ry * t.sin()];
+        let mut best = None;
+        for _ in 0..12 {
+            let e = eval(t);
+            let ex = rx * t.sin();
+            let ey = ry * t.cos();
+            // f(t) = (E - L)·E'; f'(t) = |E'|² + (E - L)·E''.
+            let f = (e[0] - lx) * -ex + (e[1] - ly) * ey;
+            let fp = ex * ex + ey * ey + (e[0] - lx) * -e[0] + (e[1] - ly) * -e[1];
+            if !(fp.abs() > 1e-9) {
+                break;
+            }
+            let step = f / fp;
+            if !step.is_finite() {
+                break;
+            }
+            t -= step;
+            let e = eval(t);
+            let d = (e[0] - lx).hypot(e[1] - ly);
+            if best.is_none_or(|(_, bd)| d < bd) {
+                // Back into document space (rotation by +a, translate).
+                best = Some(([self.center[0] + ca * e[0] - sa * e[1], self.center[1] + sa * e[0] + ca * e[1]], d));
+            }
+            if step.abs() < 1e-9 {
+                break;
+            }
+        }
+        // The parametric guess itself is the fallback when Newton never improves.
+        if best.is_none() {
+            let e = eval(t);
+            best = Some(([self.center[0] + ca * e[0] - sa * e[1], self.center[1] + sa * e[0] + ca * e[1]], (e[0] - lx).hypot(e[1] - ly)));
+        }
+        best
+    }
+}
+
+/// Concentric circles about `center`, one ring every `spacing`: strokes snap onto the
+/// nearest ring.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConcentricAssistant {
+    pub center: [f64; 2],
+    pub spacing: f64,
+}
+
+impl Default for ConcentricAssistant {
+    fn default() -> Self {
+        Self { center: [0.0, 0.0], spacing: 20.0 }
+    }
+}
+
+impl ConcentricAssistant {
+    /// `None` for a bad center or an unusable spacing.
+    pub fn new(center: [f64; 2], spacing: f64) -> Option<Self> {
+        if !in_range(center) || !valid_spacing(spacing) {
+            return None;
+        }
+        Some(Self { center, spacing })
+    }
+}
+
+/// A regular polygon ruler: strokes snap onto its edges.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolygonAssistant {
+    pub center: [f64; 2],
+    pub radius: f64,
+    pub sides: u32,
+    pub rotation_deg: f64,
+}
+
+impl Default for PolygonAssistant {
+    fn default() -> Self {
+        Self { center: [0.0, 0.0], radius: 60.0, sides: 5, rotation_deg: -90.0 }
+    }
+}
+
+impl PolygonAssistant {
+    /// `None` for a bad center, a non-positive radius, fewer than 3 (or more than 64) sides,
+    /// or a non-finite rotation.
+    pub fn new(center: [f64; 2], radius: f64, sides: u32, rotation_deg: f64) -> Option<Self> {
+        if !in_range(center) || !radius.is_finite() || radius <= 0.0 || radius > MAX_COORDINATE || !(3..=64).contains(&sides) || !rotation_deg.is_finite() {
+            return None;
+        }
+        Some(Self { center, radius, sides, rotation_deg })
+    }
+
+    /// Vertices in document space; `None` for degenerate stored geometry.
+    fn vertices(&self) -> Option<Vec<[f64; 2]>> {
+        if !in_range(self.center) || !(self.radius > 0.0) || !(3..=64).contains(&self.sides) || !self.rotation_deg.is_finite() {
+            return None;
+        }
+        let a0 = self.rotation_deg.to_radians();
+        Some(
+            (0..self.sides)
+                .map(|i| {
+                    let a = a0 + f64::from(i) * std::f64::consts::TAU / f64::from(self.sides);
+                    [self.center[0] + self.radius * a.cos(), self.center[1] + self.radius * a.sin()]
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Nearest point on segment `ab` and its distance.
+fn nearest_on_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> ([f64; 2], f64) {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let denom = ab[0] * ab[0] + ab[1] * ab[1];
+    let t = if denom > 1e-12 { ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / denom } else { 0.0 }.clamp(0.0, 1.0);
+    let q = [a[0] + ab[0] * t, a[1] + ab[1] * t];
+    (q, (p[0] - q[0]).hypot(p[1] - q[1]))
+}
+
+/// A fisheye (curvilinear) perspective ruler: plate-space perspective rays bent through an
+/// equidistant azimuthal projection about `center`, inside the lens circle of `radius`.
+/// `strength` 0 is linear perspective; 1 is full fisheye. Outside the lens nothing snaps,
+/// as in Clip Studio Paint.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FisheyeAssistant {
+    pub center: [f64; 2],
+    pub radius: f64,
+    pub strength: f64,
+    pub vps: Vec<[f64; 2]>,
+    pub horizon_y: Option<f64>,
+    pub rays: Vec<PerspectiveRay>,
+}
+
+impl FisheyeAssistant {
+    /// `None` for a bad center, a non-positive radius, a strength outside 0–1, bad vanishing
+    /// points, or invalid rays (same ray rules as perspective).
+    pub fn new(center: [f64; 2], radius: f64, strength: f64, vps: Vec<[f64; 2]>, horizon_y: Option<f64>, rays: Vec<PerspectiveRay>) -> Option<Self> {
+        if !in_range(center) || !radius.is_finite() || radius <= 0.0 || radius > MAX_COORDINATE || !strength.is_finite() || strength < 0.0 || strength > 1.0 {
+            return None;
+        }
+        if vps.is_empty() || vps.len() > MAX_VANISHING_POINTS || !vps.iter().all(|p| in_range(*p)) {
+            return None;
+        }
+        if horizon_y.is_some_and(|h| !h.is_finite() || h.abs() > MAX_COORDINATE) {
+            return None;
+        }
+        if rays.len() > MAX_RAYS || rays.iter().any(|r| r.vp >= vps.len() || dir_from_deg(r.angle_deg).is_none()) {
+            return None;
+        }
+        Some(Self { center, radius, strength, vps, horizon_y, rays })
+    }
+
+    /// Distort plate point `q` into lens space; `None` outside the lens.
+    fn forward(&self, q: [f64; 2]) -> Option<[f64; 2]> {
+        let dx = (q[0] - self.center[0]) / self.radius;
+        let dy = (q[1] - self.center[1]) / self.radius;
+        let r = dx.hypot(dy);
+        if !(r <= 1.0) || !r.is_finite() {
+            return None;
+        }
+        let m = (1.0 - self.strength) + self.strength * r * r;
+        Some([self.center[0] + self.radius * dx * m, self.center[1] + self.radius * dy * m])
+    }
+
+    /// Undistort lens point `p` into plate space; `None` outside the lens. The radial map
+    /// `r * m(r)` is strictly increasing on [0, 1] for strengths in 0–1, so bisection lands.
+    fn backward(&self, p: [f64; 2]) -> Option<[f64; 2]> {
+        let dx = (p[0] - self.center[0]) / self.radius;
+        let dy = (p[1] - self.center[1]) / self.radius;
+        let rv = dx.hypot(dy);
+        if !(rv <= 1.0) || !rv.is_finite() {
+            return None;
+        }
+        if rv < 1e-12 {
+            return Some(self.center);
+        }
+        let (mut lo, mut hi) = (0.0, 1.0);
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            if mid * ((1.0 - self.strength) + self.strength * mid * mid) < rv {
+                lo = mid
+            } else {
+                hi = mid
+            };
+        }
+        let r = 0.5 * (lo + hi);
+        Some([self.center[0] + self.radius * dx / rv * r, self.center[1] + self.radius * dy / rv * r])
+    }
+}
+
+/// The guide geometry of one assistant. New kinds only add a variant plus its trait impl:
+/// the stroke pipeline, overlay renderer, commands, persistence and UI need no changes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum DrawingAssistantKind {
     StraightLine(StraightLineAssistant),
     Perspective(PerspectiveAssistant),
+    Bezier(BezierAssistant),
+    Parallel(ParallelAssistant),
+    Ellipse(EllipseAssistant),
+    Concentric(ConcentricAssistant),
+    Polygon(PolygonAssistant),
+    Fisheye(FisheyeAssistant),
 }
 
 /// A visual primitive for the canvas overlay renderer (toolkit-agnostic data, like the tool
 /// overlay seam: the UI draws these, it never computes guide geometry itself).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GuidePrimitive {
-    /// A guide segment in document pixels.
-    Segment { a: [f64; 2], b: [f64; 2] },
+    /// A guide segment in document pixels. `major` marks the primary guides (the straight
+    /// line itself, the horizon): the UI draws those solid and the secondary ray fan dotted.
+    Segment { a: [f64; 2], b: [f64; 2], major: bool },
     /// An interactive drag handle in document pixels.
     Handle { pos: [f64; 2], kind: HandleKind },
 }
@@ -239,6 +600,9 @@ pub enum HandleKind {
     Angle,
     /// Vanishing point `usize` (moves the point and its rays).
     VanishingPoint(usize),
+    /// A kind-specific control point by index (Bézier control points, ellipse/polygon/fisheye
+    /// handles); the command validates the index against the kind.
+    ControlPoint(usize),
 }
 
 /// The extensible assistant interface: snapping plus overlay, in document pixels.
@@ -266,7 +630,7 @@ impl DrawingAssistant for StraightLineAssistant {
         let mut out = Vec::new();
         let Some(d) = self.direction() else { return out };
         if let Some([a, b]) = clip_line(self.anchor, d, viewport) {
-            out.push(GuidePrimitive::Segment { a, b });
+            out.push(GuidePrimitive::Segment { a, b, major: true });
         }
         out.push(GuidePrimitive::Handle { pos: self.anchor, kind: HandleKind::Anchor });
         // Angle handle at a fixed document distance along the line (viewport-independent, so it
@@ -285,24 +649,8 @@ impl DrawingAssistant for PerspectiveAssistant {
         if !finite2(point) || !usable_radius(snap_radius) {
             return None;
         }
-        let mut best: Option<([f64; 2], f64)> = None;
-        let mut consider = |q: [f64; 2], dist: f64| {
-            if dist <= snap_radius && finite2(q) && best.is_none_or(|(_, bd)| dist < bd) {
-                best = Some((q, dist));
-            }
-        };
-        for ray in &self.rays {
-            let (Some(vp), Some(d)) = (self.vps.get(ray.vp).copied(), dir_from_deg(ray.angle_deg)) else { continue };
-            if !in_range(vp) {
-                continue;
-            }
-            let (q, dist) = project(point, vp, d);
-            consider(q, dist);
-        }
-        if let Some(h) = self.horizon_y.filter(|h| h.is_finite() && h.abs() <= MAX_COORDINATE) {
-            consider([point[0], h], (point[1] - h).abs());
-        }
-        best.map(|(q, _)| q)
+        let (q, dist) = snap_to_rays(&self.vps, &self.rays, self.horizon_y, point)?;
+        (dist <= snap_radius).then_some(q)
     }
 
     fn overlay_primitives(&self, viewport: [f64; 4]) -> Vec<GuidePrimitive> {
@@ -313,15 +661,291 @@ impl DrawingAssistant for PerspectiveAssistant {
                 continue;
             }
             if let Some([a, b]) = clip_ray(vp, d, viewport) {
-                out.push(GuidePrimitive::Segment { a, b });
+                out.push(GuidePrimitive::Segment { a, b, major: false });
             }
         }
         let [x0, _, x1, _] = viewport;
         if let Some(h) = self.horizon_y.filter(|h| h.is_finite() && h.abs() <= MAX_COORDINATE) {
             let [_, y0, _, y1] = viewport;
             if h >= y0 && h <= y1 && x0 < x1 {
-                out.push(GuidePrimitive::Segment { a: [x0, h], b: [x1, h] });
+                out.push(GuidePrimitive::Segment { a: [x0, h], b: [x1, h], major: true });
             }
+        }
+        for (i, vp) in self.vps.iter().enumerate() {
+            if in_range(*vp) {
+                out.push(GuidePrimitive::Handle { pos: *vp, kind: HandleKind::VanishingPoint(i) });
+            }
+        }
+        out
+    }
+}
+
+impl DrawingAssistant for BezierAssistant {
+    fn snap_point(&self, point: [f64; 2], snap_radius: f64) -> Option<[f64; 2]> {
+        if !finite2(point) || !usable_radius(snap_radius) || !self.points.iter().all(|p| in_range(*p)) {
+            return None;
+        }
+        let (q, dist) = nearest_on_cubic(&self.points, point);
+        (dist <= snap_radius && finite2(q)).then_some(q)
+    }
+
+    fn overlay_primitives(&self, viewport: [f64; 4]) -> Vec<GuidePrimitive> {
+        let mut out = Vec::new();
+        if !self.points.iter().all(|p| in_range(*p)) {
+            return out;
+        }
+        // The curve as short solid majors, the control polygon as dotted minors.
+        const STEPS: usize = 24;
+        let mut prev = bezier_eval(&self.points, 0.0);
+        for i in 1..=STEPS {
+            let q = bezier_eval(&self.points, i as f64 / STEPS as f64);
+            out.push(GuidePrimitive::Segment { a: prev, b: q, major: true });
+            prev = q;
+        }
+        for w in self.points.windows(2) {
+            out.push(GuidePrimitive::Segment { a: w[0], b: w[1], major: false });
+        }
+        let _ = viewport;
+        for (i, p) in self.points.iter().enumerate() {
+            out.push(GuidePrimitive::Handle { pos: *p, kind: HandleKind::ControlPoint(i) });
+        }
+        out
+    }
+}
+
+impl DrawingAssistant for ParallelAssistant {
+    fn snap_point(&self, point: [f64; 2], snap_radius: f64) -> Option<[f64; 2]> {
+        if !finite2(point) || !usable_radius(snap_radius) {
+            return None;
+        }
+        let d = self.direction()?;
+        let n = [-d[1], d[0]];
+        let s = (point[0] - self.anchor[0]) * n[0] + (point[1] - self.anchor[1]) * n[1];
+        let k = (s / self.spacing).round();
+        let off = s - k * self.spacing;
+        (off.abs() <= snap_radius).then(|| [point[0] - n[0] * off, point[1] - n[1] * off]).filter(|q| finite2(*q))
+    }
+
+    fn overlay_primitives(&self, viewport: [f64; 4]) -> Vec<GuidePrimitive> {
+        let mut out = Vec::new();
+        let Some(d) = self.direction() else { return out };
+        if let Some([a, b]) = clip_line(self.anchor, d, viewport) {
+            out.push(GuidePrimitive::Segment { a, b, major: true });
+        }
+        // Family lines covering the viewport, strided so a dense comb stays bounded.
+        let n = [-d[1], d[0]];
+        let corners = [[viewport[0], viewport[1]], [viewport[2], viewport[1]], [viewport[2], viewport[3]], [viewport[0], viewport[3]]];
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for c in corners {
+            let s = (c[0] - self.anchor[0]) * n[0] + (c[1] - self.anchor[1]) * n[1];
+            lo = lo.min(s);
+            hi = hi.max(s);
+        }
+        if !(lo.is_finite() && hi.is_finite()) {
+            return out;
+        }
+        // Family lines covering the viewport; a sub-pixel comb draws as the base line.
+        if (hi - lo) / self.spacing <= 256.0 {
+            let start = (lo / self.spacing).floor();
+            let count = ((hi - lo) / self.spacing).ceil() as usize;
+            for j in 0..=count.min(256) {
+                let k = start + j as f64;
+                if k == 0.0 {
+                    continue;
+                }
+                let a = [self.anchor[0] + n[0] * k * self.spacing, self.anchor[1] + n[1] * k * self.spacing];
+                if let Some([p, q]) = clip_line(a, d, viewport) {
+                    out.push(GuidePrimitive::Segment { a: p, b: q, major: false });
+                }
+            }
+        }
+        out.push(GuidePrimitive::Handle { pos: self.anchor, kind: HandleKind::Anchor });
+        const ANGLE_HANDLE_DIST: f64 = 60.0;
+        let angle_pos = [self.anchor[0] + d[0] * ANGLE_HANDLE_DIST, self.anchor[1] + d[1] * ANGLE_HANDLE_DIST];
+        if finite2(angle_pos) {
+            out.push(GuidePrimitive::Handle { pos: angle_pos, kind: HandleKind::Angle });
+        }
+        out
+    }
+}
+
+impl DrawingAssistant for EllipseAssistant {
+    fn snap_point(&self, point: [f64; 2], snap_radius: f64) -> Option<[f64; 2]> {
+        if !finite2(point) || !usable_radius(snap_radius) {
+            return None;
+        }
+        self.nearest(point).and_then(|(q, dist)| (dist <= snap_radius && finite2(q)).then_some(q))
+    }
+
+    fn overlay_primitives(&self, viewport: [f64; 4]) -> Vec<GuidePrimitive> {
+        let mut out = Vec::new();
+        let [rx, ry] = self.radii;
+        if !(rx > 0.0 && ry > 0.0) || !in_range(self.center) || !self.rotation_deg.is_finite() {
+            return out;
+        }
+        let a = self.rotation_deg.to_radians();
+        let (ca, sa) = (a.cos(), a.sin());
+        let at = |t: f64| [self.center[0] + ca * rx * t.cos() - sa * ry * t.sin(), self.center[1] + sa * rx * t.cos() + ca * ry * t.sin()];
+        const STEPS: usize = 64;
+        let mut prev = at(0.0);
+        for i in 1..=STEPS {
+            let q = at(i as f64 / STEPS as f64 * std::f64::consts::TAU);
+            out.push(GuidePrimitive::Segment { a: prev, b: q, major: true });
+            prev = q;
+        }
+        let _ = viewport;
+        out.push(GuidePrimitive::Handle { pos: self.center, kind: HandleKind::ControlPoint(0) });
+        out.push(GuidePrimitive::Handle { pos: at(0.0), kind: HandleKind::ControlPoint(1) });
+        out.push(GuidePrimitive::Handle { pos: at(std::f64::consts::FRAC_PI_2), kind: HandleKind::ControlPoint(2) });
+        out
+    }
+}
+
+impl DrawingAssistant for ConcentricAssistant {
+    fn snap_point(&self, point: [f64; 2], snap_radius: f64) -> Option<[f64; 2]> {
+        if !finite2(point) || !usable_radius(snap_radius) || !in_range(self.center) || !valid_spacing(self.spacing) {
+            return None;
+        }
+        let dx = [point[0] - self.center[0], point[1] - self.center[1]];
+        let r = dx[0].hypot(dx[1]);
+        if !(r > 1e-9) {
+            return None;
+        }
+        let k = (r / self.spacing).round().max(1.0);
+        let off = r - k * self.spacing;
+        (off.abs() <= snap_radius)
+            .then(|| [self.center[0] + dx[0] / r * k * self.spacing, self.center[1] + dx[1] / r * k * self.spacing])
+            .filter(|q| finite2(*q))
+    }
+
+    fn overlay_primitives(&self, viewport: [f64; 4]) -> Vec<GuidePrimitive> {
+        let mut out = Vec::new();
+        if !in_range(self.center) || !valid_spacing(self.spacing) {
+            return out;
+        }
+        // Rings reaching the viewport, capped so a fine comb stays bounded.
+        let cx = 0.5 * (viewport[0] + viewport[2]);
+        let cy = 0.5 * (viewport[1] + viewport[3]);
+        let far = (self.center[0] - cx).hypot(self.center[1] - cy) + 0.5 * (viewport[2] - viewport[0]).hypot(viewport[3] - viewport[1]);
+        if !far.is_finite() {
+            return out;
+        }
+        let rings = ((far / self.spacing).ceil() as usize).min(32).max(1);
+        const STEPS: usize = 48;
+        for k in 1..=rings {
+            let r = k as f64 * self.spacing;
+            let mut prev = [self.center[0] + r, self.center[1]];
+            for i in 1..=STEPS {
+                let t = i as f64 / STEPS as f64 * std::f64::consts::TAU;
+                let q = [self.center[0] + r * t.cos(), self.center[1] + r * t.sin()];
+                out.push(GuidePrimitive::Segment { a: prev, b: q, major: false });
+                prev = q;
+            }
+        }
+        out.push(GuidePrimitive::Handle { pos: self.center, kind: HandleKind::Anchor });
+        out
+    }
+}
+
+impl DrawingAssistant for PolygonAssistant {
+    fn snap_point(&self, point: [f64; 2], snap_radius: f64) -> Option<[f64; 2]> {
+        if !finite2(point) || !usable_radius(snap_radius) {
+            return None;
+        }
+        let v = self.vertices()?;
+        let mut best: Option<([f64; 2], f64)> = None;
+        for i in 0..v.len() {
+            let (q, dist) = nearest_on_segment(point, v[i], v[(i + 1) % v.len()]);
+            if finite2(q) && best.is_none_or(|(_, bd)| dist < bd) {
+                best = Some((q, dist));
+            }
+        }
+        best.and_then(|(q, dist)| (dist <= snap_radius).then_some(q))
+    }
+
+    fn overlay_primitives(&self, viewport: [f64; 4]) -> Vec<GuidePrimitive> {
+        let mut out = Vec::new();
+        let Some(v) = self.vertices() else { return out };
+        let _ = viewport;
+        for i in 0..v.len() {
+            out.push(GuidePrimitive::Segment { a: v[i], b: v[(i + 1) % v.len()], major: true });
+        }
+        out.push(GuidePrimitive::Handle { pos: self.center, kind: HandleKind::ControlPoint(0) });
+        out.push(GuidePrimitive::Handle { pos: v[0], kind: HandleKind::ControlPoint(1) });
+        out
+    }
+}
+
+impl DrawingAssistant for FisheyeAssistant {
+    fn snap_point(&self, point: [f64; 2], snap_radius: f64) -> Option<[f64; 2]> {
+        if !finite2(point) || !usable_radius(snap_radius) || !valid_spacing(self.radius) || !in_range(self.center) {
+            return None;
+        }
+        if !(self.strength.is_finite() && (0.0..=1.0).contains(&self.strength)) {
+            return None;
+        }
+        let plate = self.backward(point)?;
+        let (q, _) = snap_to_rays(&self.vps, &self.rays, self.horizon_y, plate)?;
+        let out = self.forward(q)?;
+        let dist = (point[0] - out[0]).hypot(point[1] - out[1]);
+        (dist <= snap_radius && finite2(out)).then_some(out)
+    }
+
+    fn overlay_primitives(&self, viewport: [f64; 4]) -> Vec<GuidePrimitive> {
+        let mut out = Vec::new();
+        if !valid_spacing(self.radius) || !in_range(self.center) || !(self.strength.is_finite() && (0.0..=1.0).contains(&self.strength)) {
+            return out;
+        }
+        // The lens circle itself, so the snapping range is visible.
+        const STEPS: usize = 64;
+        let mut prev = [self.center[0] + self.radius, self.center[1]];
+        for i in 1..=STEPS {
+            let t = i as f64 / STEPS as f64 * std::f64::consts::TAU;
+            let q = [self.center[0] + self.radius * t.cos(), self.center[1] + self.radius * t.sin()];
+            out.push(GuidePrimitive::Segment { a: prev, b: q, major: true });
+            prev = q;
+        }
+        // Each ray bent through the lens, sampled and clipped to the disc.
+        const SAMPLES: usize = 17;
+        for ray in &self.rays {
+            let (Some(vp), Some(d)) = (self.vps.get(ray.vp).copied(), dir_from_deg(ray.angle_deg)) else { continue };
+            if !in_range(vp) {
+                continue;
+            }
+            // Plate-space extent reaching the lens.
+            let reach = (vp[0] - self.center[0]).hypot(vp[1] - self.center[1]) + self.radius + 1.0;
+            if !reach.is_finite() {
+                continue;
+            }
+            let mut prev: Option<[f64; 2]> = None;
+            for i in 0..=SAMPLES {
+                let t = reach * i as f64 / SAMPLES as f64;
+                let bent = self.forward([vp[0] + d[0] * t, vp[1] + d[1] * t]);
+                if let (Some(a), Some(b)) = (prev, bent) {
+                    out.push(GuidePrimitive::Segment { a, b, major: false });
+                }
+                prev = bent;
+            }
+        }
+        if let Some(h) = self.horizon_y.filter(|h| h.is_finite() && h.abs() <= MAX_COORDINATE) {
+            // The horizon bent through the lens.
+            let [x0, _, x1, _] = viewport;
+            const HSAMPLES: usize = 25;
+            let mut prev: Option<[f64; 2]> = None;
+            for i in 0..=HSAMPLES {
+                let x = x0 + (x1 - x0) * i as f64 / HSAMPLES as f64;
+                let bent = self.forward([x, h]);
+                if let (Some(a), Some(b)) = (prev, bent) {
+                    out.push(GuidePrimitive::Segment { a, b, major: true });
+                }
+                prev = bent;
+            }
+        }
+        out.push(GuidePrimitive::Handle { pos: self.center, kind: HandleKind::Anchor });
+        let radius_pos = [self.center[0] + self.radius, self.center[1]];
+        if finite2(radius_pos) {
+            out.push(GuidePrimitive::Handle { pos: radius_pos, kind: HandleKind::ControlPoint(0) });
         }
         for (i, vp) in self.vps.iter().enumerate() {
             if in_range(*vp) {
@@ -337,6 +961,12 @@ impl DrawingAssistant for DrawingAssistantKind {
         match self {
             Self::StraightLine(a) => a.snap_point(point, snap_radius),
             Self::Perspective(a) => a.snap_point(point, snap_radius),
+            Self::Bezier(a) => a.snap_point(point, snap_radius),
+            Self::Parallel(a) => a.snap_point(point, snap_radius),
+            Self::Ellipse(a) => a.snap_point(point, snap_radius),
+            Self::Concentric(a) => a.snap_point(point, snap_radius),
+            Self::Polygon(a) => a.snap_point(point, snap_radius),
+            Self::Fisheye(a) => a.snap_point(point, snap_radius),
         }
     }
 
@@ -344,30 +974,43 @@ impl DrawingAssistant for DrawingAssistantKind {
         match self {
             Self::StraightLine(a) => a.overlay_primitives(viewport),
             Self::Perspective(a) => a.overlay_primitives(viewport),
+            Self::Bezier(a) => a.overlay_primitives(viewport),
+            Self::Parallel(a) => a.overlay_primitives(viewport),
+            Self::Ellipse(a) => a.overlay_primitives(viewport),
+            Self::Concentric(a) => a.overlay_primitives(viewport),
+            Self::Polygon(a) => a.overlay_primitives(viewport),
+            Self::Fisheye(a) => a.overlay_primitives(viewport),
         }
     }
 }
 
-/// One assistant on the canvas: an id for the commands, a display name, visibility, and its
-/// geometry.
+/// One assistant on the canvas: an id for the commands, a display name, visibility, whether
+/// its guides snap strokes (off draws the overlay dimmed), and its geometry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DrawingAssistantItem {
     pub id: AssistantId,
     pub name: String,
     pub visible: bool,
+    pub snapping: bool,
     pub kind: DrawingAssistantKind,
 }
 
 impl DrawingAssistantItem {
     pub fn new(name: String, kind: DrawingAssistantKind) -> Self {
-        Self { id: AssistantId::fresh(), name, visible: true, kind }
+        Self { id: AssistantId::fresh(), name, visible: true, snapping: true, kind }
     }
 }
 
 impl Default for DrawingAssistantItem {
     fn default() -> Self {
-        Self { id: AssistantId::fresh(), name: String::new(), visible: true, kind: DrawingAssistantKind::StraightLine(StraightLineAssistant::default()) }
+        Self {
+            id: AssistantId::fresh(),
+            name: String::new(),
+            visible: true,
+            snapping: true,
+            kind: DrawingAssistantKind::StraightLine(StraightLineAssistant::default()),
+        }
     }
 }
 
@@ -408,8 +1051,8 @@ impl DrawingAssistants {
         self.items.iter_mut().find(|a| a.id == id)
     }
 
-    /// The nearest snap across every visible assistant, or `None` when snapping is off, the
-    /// radius is unusable, or nothing is close enough. First in document order wins ties.
+    /// The nearest snap across every visible, snapping assistant, or `None` when snapping is
+    /// off, the radius is unusable, or nothing is close enough. First in document order wins ties.
     pub fn snap_point(&self, point: [f64; 2]) -> Option<AssistSnap> {
         self.snap_point_with_radius(point, self.snap_radius)
     }
@@ -420,7 +1063,7 @@ impl DrawingAssistants {
             return None;
         }
         let mut best: Option<(AssistSnap, f64)> = None;
-        for item in self.items.iter().filter(|a| a.visible) {
+        for item in self.items.iter().filter(|a| a.visible && a.snapping) {
             if let Some(q) = item.kind.snap_point(point, radius) {
                 let dist = (point[0] - q[0]).hypot(point[1] - q[1]);
                 if best.is_none_or(|(_, bd)| dist < bd) {
@@ -459,7 +1102,7 @@ mod tests {
         let viewport = [0.0, -MAX_COORDINATE - 1.0, 100.0, MAX_COORDINATE + 1.0];
         for horizon in [-MAX_COORDINATE, 0.0, MAX_COORDINATE] {
             let p = PerspectiveAssistant { horizon_y: Some(horizon), ..Default::default() };
-            assert_eq!(p.overlay_primitives(viewport), vec![GuidePrimitive::Segment { a: [0.0, horizon], b: [100.0, horizon] }]);
+            assert_eq!(p.overlay_primitives(viewport), vec![GuidePrimitive::Segment { a: [0.0, horizon], b: [100.0, horizon], major: true }]);
             assert_eq!(p.snap_point([50.0, horizon], 0.0), Some([50.0, horizon]));
         }
         for horizon in [-MAX_COORDINATE - 1.0, MAX_COORDINATE + 1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -597,13 +1240,36 @@ mod tests {
     }
 
     #[test]
+    fn non_snapping_assistant_guides_but_never_snaps() {
+        let mut set = DrawingAssistants::default();
+        let mut h = DrawingAssistantItem::new("h".into(), DrawingAssistantKind::StraightLine(StraightLineAssistant::new([0.0, 100.0], 0.0).expect("h")));
+        h.snapping = false;
+        set.items.push(h);
+        assert_eq!(set.snap_point([50.0, 104.0]), None, "visible but not snapping");
+        assert!(!set.overlay_primitives([0.0, 0.0, 400.0, 300.0]).is_empty(), "still drawn (dimmed by the UI)");
+        set.items[0].snapping = true;
+        assert_eq!(set.snap_point([50.0, 104.0]).map(|h| h.point), Some([50.0, 100.0]));
+    }
+
+    #[test]
+    fn overlay_marks_major_and_minor_segments() {
+        let a = straight();
+        let prims = a.overlay_primitives([0.0, 0.0, 400.0, 300.0]);
+        assert!(prims.iter().any(|p| matches!(p, GuidePrimitive::Segment { major: true, .. })), "the line itself is major");
+        let p = PerspectiveAssistant::with_default_rays(vec![[200.0, 150.0]], None, 90.0).expect("guide");
+        let prims = p.overlay_primitives([0.0, 0.0, 400.0, 300.0]);
+        assert!(prims.iter().any(|p| matches!(p, GuidePrimitive::Segment { major: true, .. })), "the horizon is major");
+        assert!(prims.iter().any(|p| matches!(p, GuidePrimitive::Segment { major: false, .. })), "the ray fan is minor");
+    }
+
+    #[test]
     fn overlay_clips_to_viewport() {
         let a = straight();
         let prims = a.overlay_primitives([0.0, 0.0, 400.0, 300.0]);
         let seg = prims
             .iter()
             .find_map(|p| match *p {
-                GuidePrimitive::Segment { a, b } => Some((a, b)),
+                GuidePrimitive::Segment { a, b, .. } => Some((a, b)),
                 _ => None,
             })
             .expect("a segment");

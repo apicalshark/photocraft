@@ -31,9 +31,9 @@ pub use adjust::Adjustment;
 pub use advanced::{AdvancedBlending, Knockout};
 pub use analysis::{CountGroup, Measurement, MeasurementScale, Note, Ruler};
 pub use assistants::{
-    AssistSnap, AssistantId, DEFAULT_SNAP_RADIUS, DrawingAssistant, DrawingAssistantItem, DrawingAssistantKind, DrawingAssistants, GuidePrimitive, HandleKind,
-    MAX_ASSISTANTS, MAX_COORDINATE as MAX_ASSISTANT_COORDINATE, MAX_RAYS, MAX_SNAP_RADIUS, MAX_VANISHING_POINTS, PerspectiveAssistant, PerspectiveRay,
-    StraightLineAssistant,
+    AssistSnap, AssistantId, BezierAssistant, ConcentricAssistant, DEFAULT_SNAP_RADIUS, DrawingAssistant, DrawingAssistantItem, DrawingAssistantKind,
+    DrawingAssistants, EllipseAssistant, FisheyeAssistant, GuidePrimitive, HandleKind, MAX_ASSISTANTS, MAX_COORDINATE as MAX_ASSISTANT_COORDINATE, MAX_RAYS,
+    MAX_SNAP_RADIUS, MAX_VANISHING_POINTS, ParallelAssistant, PerspectiveAssistant, PerspectiveRay, PolygonAssistant, StraightLineAssistant,
 };
 pub use blend_if::{BlendIf, BlendRange};
 pub use comps::{Artboard, ArtboardBackground, CompAppearance, CompLayerState, LayerComp};

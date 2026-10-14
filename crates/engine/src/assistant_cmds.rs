@@ -7,7 +7,10 @@
 //! overlay reads the same set through [`photocraft_doc::DrawingAssistant::overlay_primitives`].
 
 use photocraft_doc::assistants::is_valid_snap_radius;
-use photocraft_doc::{AssistantId, DrawingAssistantItem, DrawingAssistantKind, MAX_ASSISTANTS, MAX_SNAP_RADIUS, PerspectiveAssistant, StraightLineAssistant};
+use photocraft_doc::{
+    AssistantId, BezierAssistant, ConcentricAssistant, DrawingAssistantItem, DrawingAssistantKind, EllipseAssistant, FisheyeAssistant, MAX_ASSISTANTS,
+    MAX_SNAP_RADIUS, ParallelAssistant, PerspectiveAssistant, PolygonAssistant, StraightLineAssistant,
+};
 use photocraft_paint::StrokePoint;
 use serde_json::{Value, json};
 
@@ -28,7 +31,7 @@ fn has_doc(s: &Session) -> std::result::Result<(), String> {
 /// its input along a far anchor's line) keep their raw position instead: the pipeline never
 /// sees coordinates it did not validate.
 pub fn snap_stroke_points(set: &photocraft_doc::DrawingAssistants, pts: &[StrokePoint]) -> Vec<StrokePoint> {
-    if !set.enabled || set.items.iter().all(|a| !a.visible) {
+    if !set.enabled || set.items.iter().all(|a| !a.visible || !a.snapping) {
         return pts.to_vec();
     }
     pts.iter()
@@ -56,8 +59,18 @@ fn item_json(a: &DrawingAssistantItem) -> Value {
             "perspective",
             json!({"points": p.vps, "horizonY": p.horizon_y, "rays": p.rays.iter().map(|r| json!({"vp": r.vp, "angleDeg": r.angle_deg})).collect::<Vec<_>>()}),
         ),
+        DrawingAssistantKind::Bezier(b) => ("bezier", json!({"points": b.points})),
+        DrawingAssistantKind::Parallel(p) => ("parallel", json!({"anchor": p.anchor, "angleDeg": p.angle_deg, "spacing": p.spacing})),
+        DrawingAssistantKind::Ellipse(e) => ("ellipse", json!({"center": e.center, "radii": e.radii, "rotationDeg": e.rotation_deg})),
+        DrawingAssistantKind::Concentric(c) => ("concentric", json!({"center": c.center, "spacing": c.spacing})),
+        DrawingAssistantKind::Polygon(g) => ("polygon", json!({"center": g.center, "radius": g.radius, "sides": g.sides, "rotationDeg": g.rotation_deg})),
+        DrawingAssistantKind::Fisheye(f) => (
+            "fisheye",
+            json!({"center": f.center, "radius": f.radius, "strength": f.strength, "points": f.vps, "horizonY": f.horizon_y,
+                "rays": f.rays.iter().map(|r| json!({"vp": r.vp, "angleDeg": r.angle_deg})).collect::<Vec<_>>()}),
+        ),
     };
-    json!({"id": a.id.0, "name": a.name, "visible": a.visible, "kind": kind, "detail": detail})
+    json!({"id": a.id.0, "name": a.name, "visible": a.visible, "snapping": a.snapping, "kind": kind, "detail": detail})
 }
 
 fn list_json(s: &Session) -> Result<Value> {
@@ -161,7 +174,7 @@ fn add_perspective(s: &mut Session, p: &Value) -> Result<Value> {
         Some(v) => v.as_f64().ok_or_else(|| bad(CMD, "`rayStep` must be a number (degrees)"))?,
     };
     let guide = PerspectiveAssistant::with_default_rays(points, horizon, step)
-        .ok_or_else(|| bad(CMD, "need 1–4 finite vanishing points within ±1000000, a finite `horizonY`, and a `rayStep` between 0° and 180°"))?;
+        .ok_or_else(|| bad(CMD, "need 1–8 finite vanishing points within ±1000000, a finite `horizonY`, and a `rayStep` between 0° and 180°"))?;
     let name = name_param(s, p, "Perspective");
     let mut out = Value::Null;
     s.edit("Add Assistant", |doc, _| {
@@ -250,8 +263,8 @@ fn clear(s: &mut Session, _p: &Value) -> Result<Value> {
     Ok(json!({"cleared": true}))
 }
 
-/// Move a straight-line assistant's anchor (canvas handle drag; pass `"coalesce": "assist-drag"`
-/// so a drag is one undo step).
+/// Move a straight-line/parallel anchor, or a concentric/fisheye center (canvas handle
+/// drag; pass `"coalesce": "assist-drag"` so a drag is one undo step).
 fn move_anchor(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "assist.moveAnchor";
     let id = get_mut(s, CMD, p)?;
@@ -259,19 +272,33 @@ fn move_anchor(s: &mut Session, p: &Value) -> Result<Value> {
     if p.get("anchor").is_none() {
         return Err(bad(CMD, "missing `anchor`"));
     }
+    if !anchor[0].is_finite() || !anchor[1].is_finite() {
+        return Err(bad(CMD, "`anchor` must be finite coordinates"));
+    }
     s.edit("Move Assistant", |doc, _| {
         let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
-        let DrawingAssistantKind::StraightLine(line) = &mut a.kind else {
-            return Err(EngineError::BadParams { cmd: CMD.into(), msg: "this assistant has no anchor".into() });
-        };
-        *line = StraightLineAssistant::new(anchor, line.angle_deg)
-            .ok_or_else(|| EngineError::BadParams { cmd: CMD.into(), msg: "`anchor` must be finite coordinates within ±1000000".into() })?;
+        match &mut a.kind {
+            DrawingAssistantKind::StraightLine(line) => {
+                *line = StraightLineAssistant::new(anchor, line.angle_deg).ok_or_else(|| bad(CMD, "`anchor` must be within ±1000000"))?;
+            }
+            DrawingAssistantKind::Parallel(par) => {
+                *par = ParallelAssistant::new(anchor, par.angle_deg, par.spacing).ok_or_else(|| bad(CMD, "`anchor` must be within ±1000000"))?;
+            }
+            DrawingAssistantKind::Concentric(con) => {
+                *con = ConcentricAssistant::new(anchor, con.spacing).ok_or_else(|| bad(CMD, "`anchor` must be within ±1000000"))?;
+            }
+            DrawingAssistantKind::Fisheye(fish) => {
+                *fish = FisheyeAssistant::new(anchor, fish.radius, fish.strength, fish.vps.clone(), fish.horizon_y, fish.rays.clone())
+                    .ok_or_else(|| bad(CMD, "`anchor` must be within ±1000000"))?;
+            }
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "this assistant has no anchor".into() }),
+        }
         Ok(())
     })?;
     Ok(json!({"id": id.0, "anchor": anchor}))
 }
 
-/// Rotate a straight-line assistant about its anchor (canvas angle-handle drag).
+/// Rotate a straight-line/parallel assistant about its anchor (canvas angle-handle drag).
 fn set_angle(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "assist.setAngle";
     let id = get_mut(s, CMD, p)?;
@@ -281,11 +308,15 @@ fn set_angle(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.edit("Rotate Assistant", |doc, _| {
         let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
-        let DrawingAssistantKind::StraightLine(line) = &mut a.kind else {
-            return Err(EngineError::BadParams { cmd: CMD.into(), msg: "this assistant has no angle".into() });
-        };
-        *line = StraightLineAssistant::new(line.anchor, angle)
-            .ok_or_else(|| EngineError::BadParams { cmd: CMD.into(), msg: "`angleDeg` must be a finite angle".into() })?;
+        match &mut a.kind {
+            DrawingAssistantKind::StraightLine(line) => {
+                *line = StraightLineAssistant::new(line.anchor, angle).ok_or_else(|| bad(CMD, "`angleDeg` must be a finite angle"))?;
+            }
+            DrawingAssistantKind::Parallel(par) => {
+                *par = ParallelAssistant::new(par.anchor, angle, par.spacing).ok_or_else(|| bad(CMD, "`angleDeg` must be a finite angle"))?;
+            }
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "this assistant has no angle".into() }),
+        }
         Ok(())
     })?;
     Ok(json!({"id": id.0, "angleDeg": angle}))
@@ -302,13 +333,13 @@ fn move_vanishing_point(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.edit("Move Vanishing Point", |doc, _| {
         let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
-        let DrawingAssistantKind::Perspective(guide) = &mut a.kind else {
-            return Err(EngineError::BadParams { cmd: CMD.into(), msg: "this assistant has no vanishing points".into() });
+        let vps = match &mut a.kind {
+            DrawingAssistantKind::Perspective(guide) => &mut guide.vps,
+            DrawingAssistantKind::Fisheye(fish) => &mut fish.vps,
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "this assistant has no vanishing points".into() }),
         };
-        let slot = guide
-            .vps
-            .get_mut(index as usize)
-            .ok_or_else(|| EngineError::BadParams { cmd: CMD.into(), msg: format!("vanishing point {index} does not exist") })?;
+        let slot =
+            vps.get_mut(index as usize).ok_or_else(|| EngineError::BadParams { cmd: CMD.into(), msg: format!("vanishing point {index} does not exist") })?;
         if !(point[0].is_finite()
             && point[1].is_finite()
             && point[0].abs() <= photocraft_doc::MAX_ASSISTANT_COORDINATE
@@ -320,6 +351,380 @@ fn move_vanishing_point(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(json!({"id": id.0, "index": index, "point": point}))
+}
+
+/// Rename an assistant (options-bar popup inline edit).
+fn rename(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.rename";
+    let id = get_mut(s, CMD, p)?;
+    let name = p
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && n.len() <= 120)
+        .map(str::to_string)
+        .ok_or_else(|| bad(CMD, "`name` must be 1–120 characters"))?;
+    s.edit("Rename Assistant", |doc, _| {
+        if let Some(a) = doc.assistants.get_mut(id) {
+            a.name = name.clone();
+        }
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "name": name}))
+}
+
+/// Toggle one assistant's snapping without hiding its overlay (drawn dimmed while off).
+fn set_snapping(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.setSnapping";
+    let id = get_mut(s, CMD, p)?;
+    let snapping = p.get("snapping").and_then(Value::as_bool).ok_or_else(|| bad(CMD, "`snapping` must be a boolean"))?;
+    s.edit(if snapping { "Enable Assistant Snapping" } else { "Disable Assistant Snapping" }, |doc, _| {
+        if let Some(a) = doc.assistants.get_mut(id) {
+            a.snapping = snapping;
+        }
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "snapping": snapping}))
+}
+
+/// Rebuild a perspective assistant's ray fan at a new step (the popup's density slider):
+/// vanishing points and horizon stay, only the fan density changes.
+fn set_ray_step(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.setRayStep";
+    let id = get_mut(s, CMD, p)?;
+    let step = p.get("rayStep").and_then(Value::as_f64).ok_or_else(|| bad(CMD, "`rayStep` must be a number (degrees)"))?;
+    s.edit("Assistant Ray Density", |doc, _| {
+        let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
+        let (vps, horizon, rays) = match &mut a.kind {
+            DrawingAssistantKind::Perspective(guide) => (guide.vps.clone(), guide.horizon_y, &mut guide.rays),
+            DrawingAssistantKind::Fisheye(fish) => (fish.vps.clone(), fish.horizon_y, &mut fish.rays),
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only perspective and fisheye assistants have a ray fan".into() }),
+        };
+        let rebuilt = PerspectiveAssistant::with_default_rays(vps, horizon, step)
+            .ok_or_else(|| EngineError::BadParams { cmd: CMD.into(), msg: "`rayStep` must be between 0° and 180° (exclusive of 0)".into() })?;
+        *rays = rebuilt.rays;
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "rayStep": step}))
+}
+
+fn num_param(p: &Value, cmd: &str, key: &str, fallback: f64) -> Result<f64> {
+    match p.get(key) {
+        None => Ok(fallback),
+        Some(v) => v.as_f64().ok_or_else(|| bad(cmd, format!("`{key}` must be a number"))),
+    }
+}
+
+fn points4_param(p: &Value, cmd: &str, fallback: [[f64; 2]; 4]) -> Result<[[f64; 2]; 4]> {
+    match p.get("points") {
+        None => Ok(fallback),
+        Some(v) => {
+            let a = v.as_array().filter(|a| a.len() == 4).ok_or_else(|| bad(cmd, "`points` must be 4 control points"))?;
+            let mut out = [[0.0; 2]; 4];
+            for (i, q) in a.iter().enumerate() {
+                let pair = q.as_array().filter(|a| a.len() == 2).ok_or_else(|| bad(cmd, "`points` must be 4 control points"))?;
+                out[i] = [
+                    pair.first().and_then(Value::as_f64).ok_or_else(|| bad(cmd, "`points` must be 4 control points"))?,
+                    pair.get(1).and_then(Value::as_f64).ok_or_else(|| bad(cmd, "`points` must be 4 control points"))?,
+                ];
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn sides_param(p: &Value, cmd: &str, fallback: u32) -> Result<u32> {
+    match p.get("sides") {
+        None => Ok(fallback),
+        Some(v) => v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| bad(cmd, "`sides` must be a whole number 3–64")),
+    }
+}
+
+fn add_bezier(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.addBezier";
+    check_capacity(s, CMD)?;
+    let st = s.active().ok_or(EngineError::NoDocument)?;
+    let center = [f64::from(st.doc.size.width) / 2.0, f64::from(st.doc.size.height) / 2.0];
+    let fallback = [[center[0] - 90.0, center[1]], [center[0] - 30.0, center[1]], [center[0] + 30.0, center[1]], [center[0] + 90.0, center[1]]];
+    let points = points4_param(p, CMD, fallback)?;
+    let curve = BezierAssistant::new(points).ok_or_else(|| bad(CMD, "control points must be finite coordinates within ±1000000"))?;
+    let name = name_param(s, p, "Bezier");
+    let mut out = Value::Null;
+    s.edit("Add Assistant", |doc, _| {
+        let item = DrawingAssistantItem::new(name, DrawingAssistantKind::Bezier(curve));
+        out = item_json(&item);
+        doc.assistants.items.push(item);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Move one kind-specific control handle (canvas drag): Bézier point 0–3, ellipse
+/// center/rx/ry (0–2), polygon center/corner (0–1), fisheye lens radius (0).
+fn move_control_point(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.moveControlPoint";
+    let id = get_mut(s, CMD, p)?;
+    let index = p.get("index").and_then(Value::as_u64).ok_or_else(|| bad(CMD, "`index` must be a whole number"))?;
+    let point = anchor_param(p, CMD, "point", [f64::NAN, f64::NAN])?;
+    if p.get("point").is_none() {
+        return Err(bad(CMD, "missing `point`"));
+    }
+    if !point[0].is_finite() || !point[1].is_finite() {
+        return Err(bad(CMD, "`point` must be finite coordinates"));
+    }
+    s.edit("Move Assistant Handle", |doc, _| {
+        let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
+        match &mut a.kind {
+            DrawingAssistantKind::Bezier(b) => {
+                let slot = b.points.get_mut(index as usize).ok_or_else(|| bad(CMD, format!("bezier control point {index} does not exist")))?;
+                *slot = point;
+                if !b.points.iter().all(|q| q[0].abs() <= photocraft_doc::MAX_ASSISTANT_COORDINATE && q[1].abs() <= photocraft_doc::MAX_ASSISTANT_COORDINATE) {
+                    return Err(bad(CMD, "`point` must be within ±1000000"));
+                }
+            }
+            DrawingAssistantKind::Ellipse(e) => match index {
+                0 => *e = EllipseAssistant::new(point, e.radii, e.rotation_deg).ok_or_else(|| bad(CMD, "`point` must be within ±1000000"))?,
+                1 | 2 => {
+                    let r = (point[0] - e.center[0]).hypot(point[1] - e.center[1]);
+                    let mut radii = e.radii;
+                    radii[index as usize - 1] = r;
+                    *e = EllipseAssistant::new(e.center, radii, e.rotation_deg).ok_or_else(|| bad(CMD, "radius must be positive and within ±1000000"))?;
+                }
+                _ => return Err(bad(CMD, format!("ellipse handle {index} does not exist"))),
+            },
+            DrawingAssistantKind::Polygon(g) => match index {
+                0 => *g = PolygonAssistant::new(point, g.radius, g.sides, g.rotation_deg).ok_or_else(|| bad(CMD, "`point` must be within ±1000000"))?,
+                1 => {
+                    let dx = [point[0] - g.center[0], point[1] - g.center[1]];
+                    let r = dx[0].hypot(dx[1]);
+                    let rot = dx[1].atan2(dx[0]).to_degrees();
+                    *g = PolygonAssistant::new(g.center, r, g.sides, rot).ok_or_else(|| bad(CMD, "radius must be positive and within ±1000000"))?;
+                }
+                _ => return Err(bad(CMD, format!("polygon handle {index} does not exist"))),
+            },
+            DrawingAssistantKind::Fisheye(f) => {
+                if index != 0 {
+                    return Err(bad(CMD, format!("fisheye handle {index} does not exist")));
+                }
+                let r = (point[0] - f.center[0]).hypot(point[1] - f.center[1]);
+                *f = FisheyeAssistant::new(f.center, r, f.strength, f.vps.clone(), f.horizon_y, f.rays.clone())
+                    .ok_or_else(|| bad(CMD, "lens radius must be positive and within ±1000000"))?;
+            }
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "this assistant has no control points".into() }),
+        }
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "index": index, "point": point}))
+}
+
+fn add_parallel(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.addParallel";
+    check_capacity(s, CMD)?;
+    let st = s.active().ok_or(EngineError::NoDocument)?;
+    let center = [f64::from(st.doc.size.width) / 2.0, f64::from(st.doc.size.height) / 2.0];
+    let anchor = anchor_param(p, CMD, "anchor", center)?;
+    let angle = angle_param(p, CMD, "angleDeg", 0.0)?;
+    let spacing = num_param(p, CMD, "spacing", 20.0)?;
+    let par = ParallelAssistant::new(anchor, angle, spacing)
+        .ok_or_else(|| bad(CMD, "need a finite `anchor` within ±1000000, a finite `angleDeg`, and a `spacing` between 0 and ±1000000 (exclusive of 0)"))?;
+    let name = name_param(s, p, "Parallel");
+    let mut out = Value::Null;
+    s.edit("Add Assistant", |doc, _| {
+        let item = DrawingAssistantItem::new(name, DrawingAssistantKind::Parallel(par));
+        out = item_json(&item);
+        doc.assistants.items.push(item);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Guide spacing for parallel-line and concentric assistants (the popup slider).
+fn set_spacing(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.setSpacing";
+    let id = get_mut(s, CMD, p)?;
+    let spacing = num_param(p, CMD, "spacing", f64::NAN)?;
+    if p.get("spacing").is_none() {
+        return Err(bad(CMD, "missing `spacing`"));
+    }
+    s.edit("Assistant Spacing", |doc, _| {
+        let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
+        match &mut a.kind {
+            DrawingAssistantKind::Parallel(par) => {
+                *par = ParallelAssistant::new(par.anchor, par.angle_deg, spacing)
+                    .ok_or_else(|| bad(CMD, "`spacing` must be between 0 and ±1000000 (exclusive of 0)"))?;
+            }
+            DrawingAssistantKind::Concentric(con) => {
+                *con = ConcentricAssistant::new(con.center, spacing).ok_or_else(|| bad(CMD, "`spacing` must be between 0 and ±1000000 (exclusive of 0)"))?;
+            }
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only parallel and concentric assistants have a spacing".into() }),
+        }
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "spacing": spacing}))
+}
+
+fn add_ellipse(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.addEllipse";
+    check_capacity(s, CMD)?;
+    let st = s.active().ok_or(EngineError::NoDocument)?;
+    let center = [f64::from(st.doc.size.width) / 2.0, f64::from(st.doc.size.height) / 2.0];
+    let c = anchor_param(p, CMD, "center", center)?;
+    let radii: [f64; 2] = match p.get("radii") {
+        None => [60.0, 40.0],
+        Some(v) => {
+            let a = v.as_array().filter(|a| a.len() == 2).ok_or_else(|| bad(CMD, "`radii` must be [rx, ry]"))?;
+            [
+                a.first().and_then(Value::as_f64).ok_or_else(|| bad(CMD, "`radii` must be [rx, ry]"))?,
+                a.get(1).and_then(Value::as_f64).ok_or_else(|| bad(CMD, "`radii` must be [rx, ry]"))?,
+            ]
+        }
+    };
+    let rotation = angle_param(p, CMD, "rotationDeg", 0.0)?;
+    let e = EllipseAssistant::new(c, radii, rotation)
+        .ok_or_else(|| bad(CMD, "need a finite `center` within ±1000000, positive `radii` within ±1000000, and a finite `rotationDeg`"))?;
+    let name = name_param(s, p, "Ellipse");
+    let mut out = Value::Null;
+    s.edit("Add Assistant", |doc, _| {
+        let item = DrawingAssistantItem::new(name, DrawingAssistantKind::Ellipse(e));
+        out = item_json(&item);
+        doc.assistants.items.push(item);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn set_ellipse_rotation(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.setEllipseRotation";
+    let id = get_mut(s, CMD, p)?;
+    let rotation = angle_param(p, CMD, "rotationDeg", f64::NAN)?;
+    if p.get("rotationDeg").is_none() {
+        return Err(bad(CMD, "missing `rotationDeg`"));
+    }
+    s.edit("Rotate Assistant", |doc, _| {
+        let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
+        let DrawingAssistantKind::Ellipse(e) = &mut a.kind else {
+            return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only ellipse assistants rotate".into() });
+        };
+        *e = EllipseAssistant::new(e.center, e.radii, rotation).ok_or_else(|| bad(CMD, "`rotationDeg` must be finite"))?;
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "rotationDeg": rotation}))
+}
+
+fn add_concentric(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.addConcentric";
+    check_capacity(s, CMD)?;
+    let st = s.active().ok_or(EngineError::NoDocument)?;
+    let center = [f64::from(st.doc.size.width) / 2.0, f64::from(st.doc.size.height) / 2.0];
+    let c = anchor_param(p, CMD, "center", center)?;
+    let spacing = num_param(p, CMD, "spacing", 20.0)?;
+    let con = ConcentricAssistant::new(c, spacing)
+        .ok_or_else(|| bad(CMD, "need a finite `center` within ±1000000 and a `spacing` between 0 and ±1000000 (exclusive of 0)"))?;
+    let name = name_param(s, p, "Concentric");
+    let mut out = Value::Null;
+    s.edit("Add Assistant", |doc, _| {
+        let item = DrawingAssistantItem::new(name, DrawingAssistantKind::Concentric(con));
+        out = item_json(&item);
+        doc.assistants.items.push(item);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn add_polygon(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.addPolygon";
+    check_capacity(s, CMD)?;
+    let st = s.active().ok_or(EngineError::NoDocument)?;
+    let center = [f64::from(st.doc.size.width) / 2.0, f64::from(st.doc.size.height) / 2.0];
+    let c = anchor_param(p, CMD, "center", center)?;
+    let radius = num_param(p, CMD, "radius", 60.0)?;
+    let sides = sides_param(p, CMD, 5)?;
+    let rotation = angle_param(p, CMD, "rotationDeg", -90.0)?;
+    let g = PolygonAssistant::new(c, radius, sides, rotation)
+        .ok_or_else(|| bad(CMD, "need a finite `center` within ±1000000, a positive `radius` within ±1000000, `sides` 3–64, and a finite `rotationDeg`"))?;
+    let name = name_param(s, p, "Polygon");
+    let mut out = Value::Null;
+    s.edit("Add Assistant", |doc, _| {
+        let item = DrawingAssistantItem::new(name, DrawingAssistantKind::Polygon(g));
+        out = item_json(&item);
+        doc.assistants.items.push(item);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn set_polygon_sides(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.setPolygonSides";
+    let id = get_mut(s, CMD, p)?;
+    let sides = sides_param(p, CMD, 0)?;
+    if p.get("sides").is_none() {
+        return Err(bad(CMD, "missing `sides`"));
+    }
+    if !(3..=64).contains(&sides) {
+        return Err(bad(CMD, "`sides` must be 3–64"));
+    }
+    s.edit("Assistant Sides", |doc, _| {
+        if let Some(a) = doc.assistants.get_mut(id) {
+            let DrawingAssistantKind::Polygon(g) = &mut a.kind else {
+                return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only polygon assistants have sides".into() });
+            };
+            g.sides = sides;
+        }
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "sides": sides}))
+}
+
+fn add_fisheye(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.addFisheye";
+    check_capacity(s, CMD)?;
+    let st = s.active().ok_or(EngineError::NoDocument)?;
+    let (w, h) = (f64::from(st.doc.size.width), f64::from(st.doc.size.height));
+    let center = [w / 2.0, h / 2.0];
+    let c = anchor_param(p, CMD, "center", center)?;
+    let radius = num_param(p, CMD, "radius", w.min(h) * 0.25)?;
+    let strength = num_param(p, CMD, "strength", 0.65)?;
+    let points = points_param(p, CMD, vec![center])?;
+    let horizon = match p.get("horizonY") {
+        None => None,
+        Some(v) => Some(v.as_f64().ok_or_else(|| bad(CMD, "`horizonY` must be a number"))?),
+    };
+    let step = num_param(p, CMD, "rayStep", 15.0)?;
+    let fan = PerspectiveAssistant::with_default_rays(points, horizon, step)
+        .ok_or_else(|| bad(CMD, "need 1–8 finite vanishing points within ±1000000, a finite `horizonY`, and a `rayStep` between 0° and 180°"))?;
+    let fish = FisheyeAssistant::new(c, radius, strength, fan.vps, fan.horizon_y, fan.rays)
+        .ok_or_else(|| bad(CMD, "need a finite `center` within ±1000000, a positive `radius` within ±1000000, and a `strength` between 0 and 1"))?;
+    let name = name_param(s, p, "Fisheye");
+    let mut out = Value::Null;
+    s.edit("Add Assistant", |doc, _| {
+        let item = DrawingAssistantItem::new(name, DrawingAssistantKind::Fisheye(fish));
+        out = item_json(&item);
+        doc.assistants.items.push(item);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn set_fisheye_strength(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.setFisheyeStrength";
+    let id = get_mut(s, CMD, p)?;
+    let strength = num_param(p, CMD, "strength", f64::NAN)?;
+    if p.get("strength").is_none() {
+        return Err(bad(CMD, "missing `strength`"));
+    }
+    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+        return Err(bad(CMD, "`strength` must be between 0 and 1"));
+    }
+    s.edit("Fisheye Strength", |doc, _| {
+        if let Some(a) = doc.assistants.get_mut(id) {
+            let DrawingAssistantKind::Fisheye(f) = &mut a.kind else {
+                return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only fisheye assistants have a strength".into() });
+            };
+            f.strength = strength;
+        }
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "strength": strength}))
 }
 
 /// Assistant command specs.
@@ -425,6 +830,146 @@ pub fn specs() -> Vec<CommandSpec> {
             run: move_vanishing_point,
             journal: true,
         },
+        CommandSpec {
+            id: "assist.rename",
+            label: "Rename Drawing Assistant",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":assistant id,"name":1–120 characters}"##,
+            enabled: has_doc,
+            run: rename,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.setSnapping",
+            label: "Toggle One Assistant's Snapping",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":assistant id,"snapping":bool} — overlay stays, drawn dimmed while off"##,
+            enabled: has_doc,
+            run: set_snapping,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.setRayStep",
+            label: "Assistant Ray Density",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":perspective/fisheye assistant id,"rayStep":degrees 0..180} — rebuilds the ray fan"##,
+            enabled: has_doc,
+            run: set_ray_step,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.addBezier",
+            label: "Add Bezier Assistant",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"points":4 control points?=S-curve at the canvas centre,"name":string?} — a snapping cubic curve"##,
+            enabled: has_doc,
+            run: add_bezier,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.moveControlPoint",
+            label: "Move Assistant Control Point",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":assistant id,"index":control point,"point":[x,y]} — bezier 0–3, ellipse 0–2, polygon 0–1, fisheye 0"##,
+            enabled: has_doc,
+            run: move_control_point,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.addParallel",
+            label: "Add Parallel Assistant",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"anchor":[x,y]?,"angleDeg":degrees=0,"spacing":px=20,"name":string?} — snap onto parallel lines anywhere"##,
+            enabled: has_doc,
+            run: add_parallel,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.setSpacing",
+            label: "Assistant Guide Spacing",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":parallel/concentric assistant id,"spacing":px} — distance between family lines"##,
+            enabled: has_doc,
+            run: set_spacing,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.addEllipse",
+            label: "Add Ellipse Assistant",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"center":[x,y]?,"radii":[rx,ry]?=[60,40],"rotationDeg":degrees=0,"name":string?} — snap onto the ellipse"##,
+            enabled: has_doc,
+            run: add_ellipse,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.setEllipseRotation",
+            label: "Rotate Ellipse Assistant",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":ellipse assistant id,"rotationDeg":degrees}"##,
+            enabled: has_doc,
+            run: set_ellipse_rotation,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.addConcentric",
+            label: "Add Concentric Assistant",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"center":[x,y]?,"spacing":px=20,"name":string?} — snap onto concentric rings"##,
+            enabled: has_doc,
+            run: add_concentric,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.addPolygon",
+            label: "Add Polygon Assistant",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"center":[x,y]?,"radius":px=60,"sides":3–64=5,"rotationDeg":degrees=-90,"name":string?} — snap onto the edges"##,
+            enabled: has_doc,
+            run: add_polygon,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.setPolygonSides",
+            label: "Assistant Polygon Sides",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":polygon assistant id,"sides":3–64}"##,
+            enabled: has_doc,
+            run: set_polygon_sides,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.addFisheye",
+            label: "Add Fisheye Assistant",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"center":[x,y]?,"radius":px?=quarter of the canvas,"strength":0–1=0.65,"points":[[x,y],…]?,"horizonY":px?,"rayStep":degrees=15,"name":string?} — curvilinear perspective inside the lens"##,
+            enabled: has_doc,
+            run: add_fisheye,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.setFisheyeStrength",
+            label: "Fisheye Lens Strength",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":fisheye assistant id,"strength":0–1} — 0 is linear, 1 is full fisheye"##,
+            enabled: has_doc,
+            run: set_fisheye_strength,
+            journal: true,
+        },
     ]
 }
 
@@ -490,6 +1035,60 @@ mod tests {
         let id = s.active().unwrap().doc.assistants.items[0].id.0;
         s.execute("assist.setVisible", json!({"id": id, "visible": false})).unwrap();
         assert_eq!(snap_points(&s, &pts), pts);
+    }
+
+    #[test]
+    fn rename_validates_and_persists_through_undo() {
+        let mut s = session();
+        let id = add_horizontal(&mut s, 50.0);
+        let r = s.execute("assist.rename", json!({"id": id, "name": "  Horizon  "})).unwrap();
+        assert_eq!(r["name"], json!("Horizon"), "trims whitespace");
+        assert!(s.execute("assist.rename", json!({"id": id, "name": "   "})).is_err(), "blank rejected");
+        assert!(s.execute("assist.rename", json!({"id": id, "name": "x".repeat(121)})).is_err(), "overlong rejected");
+        assert!(s.execute("assist.rename", json!({"id": 9999, "name": "Ghost"})).is_err(), "unknown id rejected");
+        s.undo();
+        assert_eq!(s.active().unwrap().doc.assistants.get(AssistantId(id)).unwrap().name, "Straight Line 1");
+        s.redo();
+        assert_eq!(s.active().unwrap().doc.assistants.get(AssistantId(id)).unwrap().name, "Horizon");
+    }
+
+    #[test]
+    fn per_item_snapping_toggle_skips_only_that_assistant() {
+        let mut s = session();
+        let id = add_horizontal(&mut s, 50.0);
+        s.execute("assist.setSnapping", json!({"id": id, "snapping": false})).unwrap();
+        let pts = vec![StrokePoint::new(10.0, 53.0, 0.5)];
+        assert_eq!(snap_points(&s, &pts), pts, "pipeline skips a non-snapping item");
+        assert!(s.execute("assist.setSnapping", json!({"id": id})).is_err(), "missing flag rejected");
+        s.execute("assist.setSnapping", json!({"id": id, "snapping": true})).unwrap();
+        let snapped = snap_points(&s, &pts);
+        assert_eq!((snapped[0].x, snapped[0].y), (10.0, 50.0));
+        let list = s.execute("assist.list", json!({})).unwrap();
+        assert_eq!(list["items"][0]["snapping"], json!(true));
+    }
+
+    #[test]
+    fn ray_step_rebuilds_only_the_fan() {
+        let mut s = session();
+        let id = s.execute("assist.addPerspective", json!({"points": [[50.0, 50.0]], "rayStep": 90.0})).unwrap()["id"].as_u64().unwrap();
+        let rays_before = match &s.active().unwrap().doc.assistants.get(AssistantId(id)).unwrap().kind {
+            DrawingAssistantKind::Perspective(p) => p.rays.len(),
+            _ => panic!("not perspective"),
+        };
+        assert_eq!(rays_before, 2);
+        s.execute("assist.setRayStep", json!({"id": id, "rayStep": 45.0})).unwrap();
+        let st = s.active().unwrap();
+        let p = match &st.doc.assistants.get(AssistantId(id)).unwrap().kind {
+            DrawingAssistantKind::Perspective(p) => p.clone(),
+            _ => panic!("not perspective"),
+        };
+        assert_eq!(p.rays.len(), 4, "45° fan doubles the rays");
+        assert_eq!(p.vps, vec![[50.0, 50.0]], "vanishing point untouched");
+        assert_eq!(p.horizon_y, Some(50.0), "horizon untouched");
+        assert!(s.execute("assist.setRayStep", json!({"id": id, "rayStep": 0.0})).is_err(), "zero step rejected");
+        assert!(s.execute("assist.setRayStep", json!({"id": id, "rayStep": 200.0})).is_err(), "over-180 rejected");
+        let lid = add_horizontal(&mut s, 10.0);
+        assert!(s.execute("assist.setRayStep", json!({"id": lid, "rayStep": 45.0})).is_err(), "straight lines have no fan");
     }
 
     #[test]

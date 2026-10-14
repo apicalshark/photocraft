@@ -1096,6 +1096,15 @@
 	Duplicate Layers…	Ebenen duplizieren…
 	Drawing assistants: snap strokes to guides	Zeichenassistenten: Striche an Hilfslinien einrasten
 	Snap to Assistants	An Assistenten einrasten
+	Snap strokes to this assistant	An diesem Assistenten einrasten
+	Rename this assistant	Diesen Assistenten umbenennen
+	Ray step	Strahlenabstand
+	Bezier	Bezier
+	Parallel	Parallel
+	Ellipse	Ellipse
+	Concentric	Konzentrisch
+	Polygon	Polygon
+	Strength	Stärke
 	Duplicate style	Stil duplizieren
 	Edit Toolbar…	Werkzeugleiste bearbeiten…
 	Use File › Open, or paste a copied image with {paste}.	Nutze Datei › Öffnen oder füge ein kopiertes Bild mit {paste} ein.

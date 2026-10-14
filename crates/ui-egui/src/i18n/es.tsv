@@ -1102,6 +1102,14 @@
 	Duplicate Layers…	Duplicar capas…
 	Drawing assistants: snap strokes to guides	Asistentes de dibujo: ajustar trazos a las guías
 	Snap to Assistants	Ajustar a los asistentes
+	Snap strokes to this assistant	Ajustar a este asistente
+	Rename this assistant	Cambiar el nombre del asistente
+	Ray step	Paso de los rayos
+	Bezier	Bezier
+	Parallel	Paralela
+	Ellipse	Elipse
+	Concentric	Concéntrico
+	Polygon	Polígono
 	Duplicate style	Duplicar estilo
 	Edit Toolbar…	Editar barra de herramientas…
 	Use File › Open, or paste a copied image with {paste}.	Use Archivo › Abrir, o pegue una imagen copiada con {paste}.

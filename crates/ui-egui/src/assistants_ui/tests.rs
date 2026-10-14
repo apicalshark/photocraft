@@ -37,7 +37,7 @@ fn anchor(app: &PhotocraftApp, id: u64) -> [f64; 2] {
     let a = st.doc.assistants.get(AssistantId(id)).unwrap();
     match &a.kind {
         DrawingAssistantKind::StraightLine(l) => l.anchor,
-        DrawingAssistantKind::Perspective(_) => panic!("not a line"),
+        _ => panic!("not a line"),
     }
 }
 
@@ -136,7 +136,7 @@ fn angle_handle_rotates_with_shift_snap() {
     let st = app.session.active().unwrap();
     let angle = match &st.doc.assistants.get(AssistantId(id)).unwrap().kind {
         DrawingAssistantKind::StraightLine(l) => l.angle_deg,
-        DrawingAssistantKind::Perspective(_) => panic!("not a line"),
+        _ => panic!("not a line"),
     };
     assert!((angle - 90.0).abs() < 1e-9, "{angle}");
     // Free rotation without ⇧: ~45° towards bottom-right.
@@ -146,7 +146,7 @@ fn angle_handle_rotates_with_shift_snap() {
     let st = app.session.active().unwrap();
     let angle = match &st.doc.assistants.get(AssistantId(id)).unwrap().kind {
         DrawingAssistantKind::StraightLine(l) => l.angle_deg,
-        DrawingAssistantKind::Perspective(_) => panic!("not a line"),
+        _ => panic!("not a line"),
     };
     assert!((angle - 45.0).abs() < 1e-6, "{angle}");
 }
@@ -162,7 +162,7 @@ fn vanishing_point_drag_moves_point_and_rays() {
     let st = app.session.active().unwrap();
     let vp = match &st.doc.assistants.items[0].kind {
         DrawingAssistantKind::Perspective(p) => p.vps[0],
-        DrawingAssistantKind::StraightLine(_) => panic!("not perspective"),
+        _ => panic!("not perspective"),
     };
     assert_eq!(vp, [150.0, 90.0]);
     // The moved horizontal ray snaps strokes: just below y = 90 lands on it.
@@ -185,4 +185,34 @@ fn press_away_from_handles_paints_normally() {
     move_to(&mut app, [20.0, 10.0], egui::Modifiers::NONE);
     up(&mut app, [20.0, 10.0]);
     assert!(app.session.journal.iter().any(|(id, _)| *id == "paint.stroke"), "the stroke commits");
+}
+
+#[test]
+fn non_snapping_assistant_still_draws_dimmed_but_pipeline_skips() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    let id = app.run("assist.addStraightLine", json!({"anchor": [100.0, 75.0], "angleDeg": 0.0})).unwrap()["id"].as_u64().unwrap();
+    let drawn_snapping = overlay_shapes(&app, &ctx);
+    assert!(drawn_snapping > 0);
+    app.run("assist.setSnapping", json!({"id": id, "snapping": false})).unwrap();
+    assert_eq!(overlay_shapes(&app, &ctx), drawn_snapping, "visible but inert: same primitives, dimmed paint");
+    // The stroke pipeline no longer snaps onto it.
+    down(&mut app, [20.0, 78.0]);
+    move_to(&mut app, [40.0, 78.0], egui::Modifiers::NONE);
+    up(&mut app, [40.0, 78.0]);
+    let (_, params) = app.session.journal.iter().rev().find(|(id, _)| *id == "paint.stroke").unwrap();
+    let ys: Vec<f64> = params["points"].as_array().unwrap().iter().map(|q| q[1].as_f64().unwrap()).collect();
+    assert!(ys.iter().all(|y| (*y - 78.0).abs() < 1e-9), "raw points pass through: {ys:?}");
+}
+
+#[test]
+fn ray_step_slider_reads_the_fan_density() {
+    let mut app = app();
+    let id = app.run("assist.addPerspective", json!({"points": [[100.0, 75.0]], "rayStep": 45.0})).unwrap()["id"].as_u64().unwrap();
+    assert_eq!(super::ray_step_of(&app, id), Some(45.0));
+    app.run("assist.setRayStep", json!({"id": id, "rayStep": 30.0})).unwrap();
+    assert_eq!(super::ray_step_of(&app, id), Some(30.0));
+    let lid = app.run("assist.addStraightLine", json!({})).unwrap()["id"].as_u64().unwrap();
+    assert_eq!(super::ray_step_of(&app, lid), None, "straight lines have no fan");
+    assert_eq!(super::ray_step_of(&app, 9999), None, "unknown id");
 }

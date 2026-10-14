@@ -699,6 +699,13 @@
 	Snap	スナップ
 	Snap To	スナップ先
 	Snap to Assistants	アシスタントにスナップ
+	Snap strokes to this assistant	このアシスタントにスナップ
+	Rename this assistant	このアシスタントの名前を変更
+	Ray step	レイ間隔
+	Bezier	ベジェ
+	Ellipse	楕円
+	Concentric	同心円
+	Polygon	多角形
 	Lock Guides	ガイドをロック
 	Clear Guides	ガイドを消去
 	Clear Selected Artboard Guides	選択したアートボードのガイドを消去

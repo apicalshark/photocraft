@@ -74,8 +74,14 @@ fn drag_of(app: &mut PhotocraftApp) -> Option<AssistantDrag> {
         st.doc.assistants.get(AssistantId(d.id)).is_some_and(|a| {
             a.visible
                 && match (d.handle, &a.kind) {
-                    (HandleKind::Anchor | HandleKind::Angle, DrawingAssistantKind::StraightLine(_)) => true,
+                    (HandleKind::Anchor | HandleKind::Angle, DrawingAssistantKind::StraightLine(_) | DrawingAssistantKind::Parallel(_)) => true,
+                    (HandleKind::Anchor, DrawingAssistantKind::Concentric(_) | DrawingAssistantKind::Fisheye(_)) => true,
                     (HandleKind::VanishingPoint(i), DrawingAssistantKind::Perspective(p)) => i < p.vps.len(),
+                    (HandleKind::VanishingPoint(i), DrawingAssistantKind::Fisheye(f)) => i < f.vps.len(),
+                    (HandleKind::ControlPoint(i), DrawingAssistantKind::Bezier(_)) => i < 4,
+                    (HandleKind::ControlPoint(i), DrawingAssistantKind::Ellipse(_)) => i < 3,
+                    (HandleKind::ControlPoint(i), DrawingAssistantKind::Polygon(_)) => i < 2,
+                    (HandleKind::ControlPoint(i), DrawingAssistantKind::Fisheye(_)) => i < 1,
                     _ => false,
                 }
         })
@@ -93,7 +99,8 @@ fn drag_to(app: &mut PhotocraftApp, d: AssistantDrag, p: [f64; 2], snap_angle: b
     let anchor = match d.handle {
         HandleKind::Angle => app.session.active().and_then(|st| st.doc.assistants.get(AssistantId(d.id))).and_then(|a| match &a.kind {
             DrawingAssistantKind::StraightLine(l) => Some(l.anchor),
-            DrawingAssistantKind::Perspective(_) => None,
+            DrawingAssistantKind::Parallel(p) => Some(p.anchor),
+            _ => None,
         }),
         _ => None,
     };
@@ -108,6 +115,7 @@ fn drag_to(app: &mut PhotocraftApp, d: AssistantDrag, p: [f64; 2], snap_angle: b
         }
         (HandleKind::Angle, None) => return,
         (HandleKind::VanishingPoint(i), _) => ("assist.moveVanishingPoint", json!({"id": d.id, "index": i, "point": p})),
+        (HandleKind::ControlPoint(i), _) => ("assist.moveControlPoint", json!({"id": d.id, "index": i, "point": p})),
     };
     let mut params = params;
     params["coalesce"] = json!("assist-drag");
@@ -158,6 +166,12 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) ->
 }
 
 /// Canvas overlay: guide segments and drag handles of every visible assistant.
+///
+/// Major guides (the straight line, the horizon) draw solid; the secondary ray fan draws
+/// dotted. Everything uses the assistants' own theme colour, so rulers never read as paths,
+/// selections or reference guides. Lines stay thin (no halo): the magenta is rare enough in
+/// artwork to read on its own, and halos turned the dotted fan into caterpillars.
+/// Assistants whose own snapping is off draw dimmed: still editable, visibly inert.
 pub fn draw(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform) {
     if !shown(app) {
         return;
@@ -167,25 +181,114 @@ pub fn draw(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform) {
         return;
     }
     let vp = viewport(xf);
-    let prims = st.doc.assistants.overlay_primitives(vp);
-    if prims.is_empty() {
-        return;
-    }
-    let painter = painter.with_clip_rect(painter.clip_rect().intersect(xf.rect));
     let t = Tokens::get(painter.ctx());
+    let painter = painter.with_clip_rect(painter.clip_rect().intersect(xf.rect));
     let screen = |p: [f64; 2]| xf.to_screen(p[0] as f32, p[1] as f32);
     let dragging = app.ui.assistant_drag;
-    for p in &prims {
-        if let GuidePrimitive::Segment { a, b } = *p {
-            painter.line_segment([screen(a), screen(b)], Stroke::new(1.0, t.accent));
+    for item in st.doc.assistants.items.iter().filter(|a| a.visible) {
+        let color = if item.snapping { t.assistant } else { t.assistant.gamma_multiply(0.4) };
+        for p in item.kind.overlay_primitives(vp) {
+            match p {
+                GuidePrimitive::Segment { a, b, major } => {
+                    let (a, b) = (screen(a), screen(b));
+                    if major {
+                        painter.line_segment([a, b], Stroke::new(1.0, color));
+                    } else {
+                        painter.add(egui::Shape::dotted_line(&[a, b], color, 6.0, 1.0));
+                    }
+                }
+                GuidePrimitive::Handle { pos, kind } => {
+                    let selected = dragging.is_some_and(|d| d.id == item.id.0 && d.handle == kind);
+                    draw_handle(&painter, screen(pos), kind, selected, color);
+                }
+            }
         }
     }
-    for p in &prims {
-        if let GuidePrimitive::Handle { pos, kind } = *p {
-            let selected = dragging.is_some_and(|d| d.handle == kind && st.doc.assistants.items.iter().any(|a| a.id.0 == d.id && a.visible));
-            crate::vector_ui::draw_anchor(&painter, screen(pos), selected, t.accent);
+}
+
+/// One assistant handle: circle for the line anchor, square for the angle, diamond for a
+/// vanishing point — never the path tool's anchor, so rulers and paths can't be confused.
+/// White-filled (assistant-filled when grabbed) with a thin assistant outline.
+fn draw_handle(painter: &egui::Painter, c: Pos2, kind: HandleKind, selected: bool, color: egui::Color32) {
+    let r = if selected { 5.0 } else { 4.0 };
+    let fill = if selected { color } else { egui::Color32::WHITE };
+    match kind {
+        HandleKind::Anchor => {
+            painter.circle_filled(c, r, fill);
+            painter.circle_stroke(c, r, Stroke::new(1.0, color));
+        }
+        HandleKind::Angle => {
+            let rect = egui::Rect::from_center_size(c, egui::vec2(2.0 * r, 2.0 * r));
+            painter.rect_filled(rect, 0.0, fill);
+            painter.rect_stroke(rect, 0.0, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+        }
+        HandleKind::VanishingPoint(_) => {
+            let d = r + 1.0;
+            let pts = vec![c + egui::vec2(0.0, -d), c + egui::vec2(d, 0.0), c + egui::vec2(0.0, d), c + egui::vec2(-d, 0.0)];
+            painter.add(egui::Shape::convex_polygon(pts, fill, Stroke::new(1.0, color)));
+        }
+        // Kind-specific control points (Bézier, ellipse, polygon, fisheye radius): a solid
+        // dot — smaller than the anchor ring, no white to confuse with path anchors.
+        HandleKind::ControlPoint(_) => {
+            painter.circle_filled(c, if selected { r } else { r - 1.0 }, color);
         }
     }
+}
+
+/// Which slider rows a popup item gets under its row.
+#[derive(Clone, Copy, PartialEq)]
+enum Extras {
+    None,
+    /// Ray-fan density (perspective).
+    Rays,
+    /// Family-line spacing (parallel, concentric).
+    Spacing,
+    /// Ray density plus lens strength (fisheye).
+    Fisheye,
+}
+
+/// The popup slider's current spacing for a parallel/concentric item.
+fn spacing_of(app: &PhotocraftApp, id: u64) -> Option<f64> {
+    let st = app.session.active()?;
+    match &st.doc.assistants.get(AssistantId(id))?.kind {
+        DrawingAssistantKind::Parallel(p) => Some(p.spacing),
+        DrawingAssistantKind::Concentric(c) => Some(c.spacing),
+        _ => None,
+    }
+}
+
+/// The popup slider's current lens strength for a fisheye item.
+fn strength_of(app: &PhotocraftApp, id: u64) -> Option<f64> {
+    let st = app.session.active()?;
+    match &st.doc.assistants.get(AssistantId(id))?.kind {
+        DrawingAssistantKind::Fisheye(f) => Some(f.strength),
+        _ => None,
+    }
+}
+
+/// The popup slider's current value: the smallest angular gap in the first vanishing
+/// point's fan (exact for default fans, a reasonable proxy for hand-built ones).
+fn ray_step_of(app: &PhotocraftApp, id: u64) -> Option<f64> {
+    let st = app.session.active()?;
+    let item = st.doc.assistants.get(AssistantId(id))?;
+    let rays = match &item.kind {
+        DrawingAssistantKind::Perspective(p) => &p.rays,
+        DrawingAssistantKind::Fisheye(f) => &f.rays,
+        _ => return None,
+    };
+    let mut angles: Vec<f64> = rays.iter().filter(|r| r.vp == 0).map(|r| r.angle_deg).collect();
+    if angles.len() < 2 {
+        return None;
+    }
+    angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut best = f64::INFINITY;
+    for w in angles.windows(2) {
+        let gap = (w[1] - w[0]).abs();
+        if gap > 1e-9 && gap < best {
+            best = gap;
+        }
+    }
+    best.is_finite().then_some(best)
 }
 
 /// Options-bar popup: the "Snap to Assistants" switch, magnetism, and assistant management.
@@ -218,16 +321,33 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             });
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button(tl!("Straight Line")).clicked() {
-                    run.push(("assist.addStraightLine", json!({})));
-                    ui.close();
-                }
-                if ui.button(tl!("Perspective")).clicked() {
-                    run.push(("assist.addPerspective", json!({})));
-                    ui.close();
+                for (label, cmd) in [
+                    (tl!("Straight Line"), "assist.addStraightLine"),
+                    (tl!("Perspective"), "assist.addPerspective"),
+                    (tl!("Bezier"), "assist.addBezier"),
+                    (tl!("Parallel"), "assist.addParallel"),
+                ] {
+                    if ui.button(label).clicked() {
+                        run.push((cmd, json!({})));
+                        ui.close();
+                    }
                 }
             });
-            let items: Vec<(u64, String, bool, String)> = app
+            ui.horizontal(|ui| {
+                for (label, cmd) in [
+                    (tl!("Ellipse"), "assist.addEllipse"),
+                    (tl!("Concentric"), "assist.addConcentric"),
+                    (tl!("Polygon"), "assist.addPolygon"),
+                    (tl!("Fisheye"), "assist.addFisheye"),
+                ] {
+                    if ui.button(label).clicked() {
+                        run.push((cmd, json!({})));
+                        ui.close();
+                    }
+                }
+            });
+            // (id, name, visible, snapping, kind label, extras row).
+            let items: Vec<(u64, String, bool, bool, String, Extras)> = app
                 .session
                 .active()
                 .map(|st| {
@@ -236,11 +356,17 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         .items
                         .iter()
                         .map(|a| {
-                            let kind = match &a.kind {
-                                DrawingAssistantKind::StraightLine(_) => tl!("Line").to_string(),
-                                DrawingAssistantKind::Perspective(_) => tl!("Perspective").to_string(),
+                            let (kind, extras) = match &a.kind {
+                                DrawingAssistantKind::StraightLine(_) => (tl!("Line").to_string(), Extras::None),
+                                DrawingAssistantKind::Perspective(_) => (tl!("Perspective").to_string(), Extras::Rays),
+                                DrawingAssistantKind::Bezier(_) => (tl!("Bezier").to_string(), Extras::None),
+                                DrawingAssistantKind::Parallel(_) => (tl!("Parallel").to_string(), Extras::Spacing),
+                                DrawingAssistantKind::Ellipse(_) => (tl!("Ellipse").to_string(), Extras::None),
+                                DrawingAssistantKind::Concentric(_) => (tl!("Concentric").to_string(), Extras::Spacing),
+                                DrawingAssistantKind::Polygon(_) => (tl!("Polygon").to_string(), Extras::None),
+                                DrawingAssistantKind::Fisheye(_) => (tl!("Fisheye").to_string(), Extras::Fisheye),
                             };
-                            (a.id.0, a.name.clone(), a.visible, kind)
+                            (a.id.0, a.name.clone(), a.visible, a.snapping, kind, extras)
                         })
                         .collect()
                 })
@@ -248,19 +374,91 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             if !items.is_empty() {
                 ui.separator();
             }
-            for (id, name, visible, kind) in items {
+            for (id, name, visible, snapping, kind, extras) in items {
                 ui.horizontal(|ui| {
                     let icon = if visible { "eye" } else { "eye-off" };
                     if crate::icons::button(ui, icon, 22.0, visible, tl!("Show/hide this assistant")).clicked() {
                         run.push(("assist.setVisible", json!({"id": id, "visible": !visible})));
                     }
-                    ui.label(format!("{name} ({kind})"));
+                    // Per-assistant snapping: the overlay dims while off, strokes pass through.
+                    let mut snap = snapping;
+                    if crate::widgets::checkbox(ui, &mut snap, "").on_hover_text(tl!("Snap strokes to this assistant")).changed() {
+                        run.push(("assist.setSnapping", json!({"id": id, "snapping": snap})));
+                    }
+                    // Inline rename: pencil toggles a one-line edit, ↩ commits, Esc cancels.
+                    let editing = app.ui.assistant_rename.as_ref().is_some_and(|(eid, _)| *eid == id);
+                    if editing {
+                        let draft = app.ui.assistant_rename.as_mut().map(|(_, d)| d).expect("editing");
+                        let resp = ui.add(egui::TextEdit::singleline(draft).desired_width(120.0).hint_text(kind.as_str()));
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            let done = app.ui.assistant_rename.take().map(|(_, d)| d).unwrap_or_default();
+                            if !done.trim().is_empty() && done.trim() != name {
+                                run.push(("assist.rename", json!({"id": id, "name": done.trim()})));
+                            }
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            app.ui.assistant_rename = None;
+                        }
+                    } else {
+                        ui.label(format!("{name} ({kind})"));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if crate::icons::button(ui, "trash", 22.0, false, tl!("Delete this assistant")).clicked() {
                             run.push(("assist.remove", json!({"id": id})));
                         }
+                        if crate::icons::button(ui, "pencil", 22.0, false, tl!("Rename this assistant")).clicked() {
+                            app.ui.assistant_rename = Some((id, name.clone()));
+                        }
                     });
                 });
+                // Per-kind sliders under the row: ray density, guide spacing, lens strength.
+                match extras {
+                    Extras::None => {}
+                    Extras::Rays => {
+                        ui.horizontal(|ui| {
+                            ui.label(tl!("Ray step"));
+                            let mut step = ray_step_of(app, id).unwrap_or(15.0);
+                            let resp = ui.add(egui::DragValue::new(&mut step).range(1.0..=180.0).speed(0.5).suffix("°"));
+                            if resp.changed() {
+                                let mut p = json!({"id": id, "rayStep": step});
+                                p["coalesce"] = json!("assist-raystep");
+                                run.push(("assist.setRayStep", p));
+                            }
+                        });
+                    }
+                    Extras::Spacing => {
+                        ui.horizontal(|ui| {
+                            ui.label(tl!("Spacing"));
+                            let mut gap = spacing_of(app, id).unwrap_or(20.0);
+                            let resp = ui.add(egui::DragValue::new(&mut gap).range(1.0..=1000000.0).speed(0.5).suffix(" px"));
+                            if resp.changed() {
+                                let mut p = json!({"id": id, "spacing": gap});
+                                p["coalesce"] = json!("assist-spacing");
+                                run.push(("assist.setSpacing", p));
+                            }
+                        });
+                    }
+                    Extras::Fisheye => {
+                        ui.horizontal(|ui| {
+                            ui.label(tl!("Ray step"));
+                            let mut step = ray_step_of(app, id).unwrap_or(15.0);
+                            let resp = ui.add(egui::DragValue::new(&mut step).range(1.0..=180.0).speed(0.5).suffix("°"));
+                            if resp.changed() {
+                                let mut p = json!({"id": id, "rayStep": step});
+                                p["coalesce"] = json!("assist-raystep");
+                                run.push(("assist.setRayStep", p));
+                            }
+                            ui.label(tl!("Strength"));
+                            let mut k = strength_of(app, id).unwrap_or(0.65);
+                            let resp = ui.add(egui::DragValue::new(&mut k).range(0.0..=1.0).speed(0.01));
+                            if resp.changed() {
+                                let mut p = json!({"id": id, "strength": k});
+                                p["coalesce"] = json!("assist-strength");
+                                run.push(("assist.setFisheyeStrength", p));
+                            }
+                        });
+                    }
+                }
             }
             for (id, params) in run {
                 let _ = app.run(id, params);

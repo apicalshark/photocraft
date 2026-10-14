@@ -710,6 +710,15 @@
 	Snap	靠齊
 	Snap To	靠齊至
 	Snap to Assistants	靠齊至助手
+	Snap strokes to this assistant	靠齊至此助手
+	Rename this assistant	重新命名此助手
+	Ray step	射線間隔
+	Bezier	貝塞爾
+	Parallel	平行線
+	Ellipse	橢圓
+	Concentric	同心圓
+	Polygon	多邊形
+	Strength	強度
 	Lock Guides	鎖定參考線
 	Clear Guides	清除參考線
 	Clear Selected Artboard Guides	清除所選工作區域參考線

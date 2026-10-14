@@ -704,6 +704,13 @@
 	Duplicate Layers…	Дублювати шари…
 	Drawing assistants: snap strokes to guides	Асистенти малювання: прив'язка мазків до напрямних
 	Snap to Assistants	Прив'язати до асистентів
+	Snap strokes to this assistant	Прив'язати до цього асистента
+	Rename this assistant	Перейменувати асистента
+	Ray step	Крок променів
+	Bezier	Безьє
+	Ellipse	Еліпс
+	Concentric	Концентричні
+	Polygon	Многокутник
 	Group name	Назва групи
 	New Group	Нова група
 	Layer Comp	Композиція шарів

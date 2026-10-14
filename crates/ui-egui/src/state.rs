@@ -1081,6 +1081,10 @@ pub struct UiState {
     /// Transient pointer state, never serialized.
     #[serde(skip)]
     pub assistant_drag: Option<crate::assistants_ui::AssistantDrag>,
+    /// A drawing-assistant rename in progress in the options-bar popup: (id, draft text).
+    /// Transient popup state, never serialized.
+    #[serde(skip)]
+    pub assistant_rename: Option<(u64, String)>,
     /// The Properties panel's armed Levels/Curves eyedropper on an adjustment layer (`layer_picker`),
     /// exposed to automation but never restored from settings.
     #[serde(default, skip_deserializing)]
@@ -1285,6 +1289,7 @@ impl Default for UiState {
             transform_unlinked: false,
             symmetry_transform: None,
             assistant_drag: None,
+            assistant_rename: None,
             layer_picker: None,
             mask_target: false,
             vector_mask_target: false,

@@ -1062,6 +1062,13 @@
 	Duplicate Layers…	Katmanları Çoğalt…
 	Drawing assistants: snap strokes to guides	Çizim yardımcıları: fırça darbelerini kılavuzlara yapıştır
 	Snap to Assistants	Yardımcılara yapıştır
+	Snap strokes to this assistant	Bu yardımcıya yapıştır
+	Rename this assistant	Yardımcıyı yeniden adlandır
+	Ray step	Işın adımı
+	Bezier	Bezier
+	Ellipse	Elips
+	Concentric	Konsantrik
+	Polygon	Poligon
 	Duplicate style	Yinelenen stil
 	Edit Toolbar…	Araç Çubuğunu Düzenle…
 	Use File › Open, or paste a copied image with {paste}.	Dosya › Aç'ı kullanın veya kopyalanan görüntüyü {paste} ile yapıştırın.

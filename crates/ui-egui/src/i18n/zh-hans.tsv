@@ -705,6 +705,15 @@
 	Snap	吸附
 	Snap To	吸附到
 	Snap to Assistants	吸附到助手
+	Snap strokes to this assistant	吸附到此助手
+	Rename this assistant	重命名此助手
+	Ray step	射线间隔
+	Bezier	贝塞尔
+	Parallel	平行线
+	Ellipse	椭圆
+	Concentric	同心圆
+	Polygon	多边形
+	Strength	强度
 	Lock Guides	锁定参考线
 	Clear Guides	清除参考线
 	Clear Selected Artboard Guides	清除所选画板的参考线

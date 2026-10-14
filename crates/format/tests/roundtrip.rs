@@ -748,10 +748,16 @@ fn drawing_assistants_roundtrip_with_ids_stable() {
     };
     // A hidden assistant round-trips too.
     doc.assistants.items[0].visible = false;
+    // A non-snapping assistant round-trips and stays silent after load.
+    doc.assistants.items[1].snapping = false;
     let bytes = save_to_bytes(&doc, &SaveOptions::default()).unwrap();
-    let back = load_from_bytes(&bytes).unwrap();
+    let mut back = load_from_bytes(&bytes).unwrap();
     assert_eq!(back, doc);
     assert_eq!(back.assistants.items[0].id, doc.assistants.items[0].id, "assistant ids stay stable");
+    assert!(!back.assistants.items[1].snapping);
+    // The hidden line and the silent perspective are skipped: nothing snaps near them.
+    assert_eq!(back.assistants.snap_point([150.0, 145.0]), None);
+    back.assistants.items[1].snapping = true;
     // And the loaded set still snaps onto the perspective horizon (y = 140).
     let hit = back.assistants.snap_point([150.0, 145.0]).expect("snaps after load");
     assert_eq!(hit.point, [150.0, 140.0]);

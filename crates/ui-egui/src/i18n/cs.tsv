@@ -1113,6 +1113,13 @@
 	Duplicate Layers…	Duplikovat vrstvy…
 	Drawing assistants: snap strokes to guides	Asistenti kreslení: přichytávání tahů k vodítkům
 	Snap to Assistants	Přichytávat k asistentům
+	Snap strokes to this assistant	Přichytit k tomuto asistentu
+	Rename this assistant	Přejmenovat asistenta
+	Ray step	Krok paprsků
+	Bezier	Bezier
+	Ellipse	Elipsa
+	Concentric	Soustředný
+	Polygon	Mnohoúhelník
 	Duplicate style	Duplikovat styl
 	Edit Toolbar…	Upravit panel nástrojů…
 	Use File › Open, or paste a copied image with {paste}.	Použijte Soubor › Otevřít, nebo vložte zkopírovaný obrázek pomocí {paste}.

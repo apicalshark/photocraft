@@ -681,6 +681,7 @@ impl Loader<'_> {
                     id: if self.preserve_ids { a.id } else { AssistantId::fresh() },
                     name: a.name.clone(),
                     visible: a.visible,
+                    snapping: a.snapping,
                     kind: a.kind.clone(),
                 })
                 .collect(),
