@@ -542,7 +542,10 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let on = app.session.active().is_some_and(|st| st.doc.assistants.enabled);
     let resp = crate::icons::button_with_icon_size(ui, "ruler", 24.0, 14.0, on && count > 0, tl!("Drawing assistants: snap strokes to guides"));
     let resp = crate::brush_picker::named(resp, "Drawing assistants: snap strokes to guides");
-    egui::Popup::menu(&resp).show(|ui| {
+    // `Popup::menu` defaults to closing on any click — inside included — which made every
+    // checkbox, slider and button dismiss the popup. Management clicks must keep it open;
+    // only outside clicks (or the toggle button) close it.
+    egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
         ui.set_min_width(WIDTH);
         ui.set_max_width(WIDTH);
         let mut run: Vec<(&str, serde_json::Value)> = Vec::new();
