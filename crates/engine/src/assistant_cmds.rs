@@ -60,7 +60,9 @@ fn item_json(a: &DrawingAssistantItem) -> Value {
             json!({"points": p.vps, "horizonY": p.horizon_y, "length": p.length, "rays": p.rays.iter().map(|r| json!({"vp": r.vp, "angleDeg": r.angle_deg})).collect::<Vec<_>>()}),
         ),
         DrawingAssistantKind::Bezier(b) => ("bezier", json!({"points": b.points})),
-        DrawingAssistantKind::Parallel(p) => ("parallel", json!({"anchor": p.anchor, "angleDeg": p.angle_deg, "spacing": p.spacing, "length": p.length})),
+        DrawingAssistantKind::Parallel(p) => {
+            ("parallel", json!({"anchor": p.anchor, "angleDeg": p.angle_deg, "spacing": p.spacing, "length": p.length, "count": p.count}))
+        }
         DrawingAssistantKind::Ellipse(e) => ("ellipse", json!({"center": e.center, "radii": e.radii, "rotationDeg": e.rotation_deg})),
         DrawingAssistantKind::Concentric(c) => ("concentric", json!({"center": c.center, "spacing": c.spacing})),
         DrawingAssistantKind::Polygon(g) => ("polygon", json!({"center": g.center, "radius": g.radius, "sides": g.sides, "rotationDeg": g.rotation_deg})),
@@ -293,7 +295,7 @@ fn move_anchor(s: &mut Session, p: &Value) -> Result<Value> {
             }
             DrawingAssistantKind::Parallel(par) => {
                 let len = par.length;
-                *par = ParallelAssistant::new(anchor, par.angle_deg, par.spacing).ok_or_else(|| bad(CMD, "`anchor` must be within ±1000000"))?;
+                *par = ParallelAssistant::new(anchor, par.angle_deg, par.spacing, par.count).ok_or_else(|| bad(CMD, "`anchor` must be within ±1000000"))?;
                 par.length = len;
             }
             DrawingAssistantKind::Concentric(con) => {
@@ -328,7 +330,7 @@ fn set_angle(s: &mut Session, p: &Value) -> Result<Value> {
             }
             DrawingAssistantKind::Parallel(par) => {
                 let len = par.length;
-                *par = ParallelAssistant::new(par.anchor, angle, par.spacing).ok_or_else(|| bad(CMD, "`angleDeg` must be a finite angle"))?;
+                *par = ParallelAssistant::new(par.anchor, angle, par.spacing, par.count).ok_or_else(|| bad(CMD, "`angleDeg` must be a finite angle"))?;
                 par.length = len;
             }
             _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "this assistant has no angle".into() }),
@@ -456,6 +458,15 @@ fn sides_param(p: &Value, cmd: &str, fallback: u32) -> Result<u32> {
     }
 }
 
+fn count_param(p: &Value, cmd: &str) -> Result<u32> {
+    match p.get("count") {
+        None => Ok(2),
+        Some(v) => {
+            v.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| (1..=16).contains(n)).ok_or_else(|| bad(cmd, "`count` must be a whole number 1–16"))
+        }
+    }
+}
+
 fn add_bezier(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "assist.addBezier";
     check_capacity(s, CMD)?;
@@ -541,8 +552,10 @@ fn add_parallel(s: &mut Session, p: &Value) -> Result<Value> {
     let anchor = anchor_param(p, CMD, "anchor", center)?;
     let angle = angle_param(p, CMD, "angleDeg", 0.0)?;
     let spacing = num_param(p, CMD, "spacing", 20.0)?;
-    let mut par = ParallelAssistant::new(anchor, angle, spacing)
-        .ok_or_else(|| bad(CMD, "need a finite `anchor` within ±1000000, a finite `angleDeg`, and a `spacing` between 0 and ±1000000 (exclusive of 0)"))?;
+    let count = count_param(p, CMD)?;
+    let mut par = ParallelAssistant::new(anchor, angle, spacing, count).ok_or_else(|| {
+        bad(CMD, "need a finite `anchor` within ±1000000, a finite `angleDeg`, a `spacing` between 0 and ±1000000 (exclusive of 0), and a `count` 1–16")
+    })?;
     par.length = diagonal(s)?;
     let name = name_param(s, p, "Parallel");
     let mut out = Value::Null;
@@ -553,6 +566,26 @@ fn add_parallel(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(out)
+}
+
+/// How many parallel lines exist, base included (the popup Lines slider).
+fn set_parallel_count(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.setParallelCount";
+    let id = get_mut(s, CMD, p)?;
+    if p.get("count").is_none() {
+        return Err(bad(CMD, "missing `count`"));
+    }
+    let count = count_param(p, CMD)?;
+    s.edit("Parallel Line Count", |doc, _| {
+        if let Some(a) = doc.assistants.get_mut(id) {
+            let DrawingAssistantKind::Parallel(par) = &mut a.kind else {
+                return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only parallel assistants have a line count".into() });
+            };
+            par.count = count;
+        }
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "count": count}))
 }
 
 /// Guide spacing for parallel-line and concentric assistants (the popup slider).
@@ -567,7 +600,7 @@ fn set_spacing(s: &mut Session, p: &Value) -> Result<Value> {
         let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
         match &mut a.kind {
             DrawingAssistantKind::Parallel(par) => {
-                *par = ParallelAssistant::new(par.anchor, par.angle_deg, spacing)
+                *par = ParallelAssistant::new(par.anchor, par.angle_deg, spacing, par.count)
                     .ok_or_else(|| bad(CMD, "`spacing` must be between 0 and ±1000000 (exclusive of 0)"))?;
             }
             DrawingAssistantKind::Concentric(con) => {
@@ -946,7 +979,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Add Parallel Assistant",
             menu: &[],
             shortcut: None,
-            params: r##"{"anchor":[x,y]?,"angleDeg":degrees=0,"spacing":px=20,"name":string?} — snap onto parallel lines anywhere"##,
+            params: r##"{"anchor":[x,y]?,"angleDeg":degrees=0,"spacing":px=20,"count":1–16=2,"name":string?} — snap onto the parallel lines"##,
             enabled: has_doc,
             run: add_parallel,
             journal: true,
@@ -959,6 +992,16 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"id":parallel/concentric assistant id,"spacing":px} — distance between family lines"##,
             enabled: has_doc,
             run: set_spacing,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.setParallelCount",
+            label: "Parallel Line Count",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":parallel assistant id,"count":1–16} — total lines, base included"##,
+            enabled: has_doc,
+            run: set_parallel_count,
             journal: true,
         },
         CommandSpec {

@@ -240,35 +240,72 @@ struct Extras {
     spacing: bool,
     strength: bool,
     length: bool,
+    count: bool,
 }
 
-/// One fixed-width slider row: label, then an 84 px field. Fixed chrome keeps the popup
-/// from stretching with long translations or big numbers.
+/// One brush-picker-style parameter row: dim label left, value field right, and a bare
+/// full-width slider below — the same chrome as the brush Size/Hardness block. Values cross
+/// as `f32` (plenty for UI ranges); the run queue carries the `f64` back to the command.
 #[allow(clippy::too_many_arguments)]
 fn slider_row(
     ui: &mut egui::Ui,
     label: &str,
-    mut value: f64,
-    range: std::ops::RangeInclusive<f64>,
-    speed: f64,
+    value: f64,
+    range: std::ops::RangeInclusive<f32>,
     suffix: &str,
+    decimals: Option<u32>,
     run: &mut Vec<(&str, serde_json::Value)>,
     id: u64,
     cmd: &'static str,
     key: &'static str,
     coalesce: &'static str,
 ) {
+    let mut v = value as f32;
+    let resp = widgets::slider_row_prec(ui, label, &mut v, range, suffix, None, widgets::RowGestures::default(), decimals);
+    if resp.changed() {
+        let mut p = json!({"id": id});
+        p[key] = json!(f64::from(v));
+        p["coalesce"] = json!(coalesce);
+        run.push((cmd, p));
+    }
+}
+
+/// Guide length: value field plus a logarithmic slider (brush-Size style: small lengths get
+/// most of the travel, huge canvases stay reachable).
+fn length_row(ui: &mut egui::Ui, id: u64, value: f64, run: &mut Vec<(&str, serde_json::Value)>) {
+    let t = Tokens::get(ui.ctx());
+    let mut v = (value.max(1.0) as f32).clamp(1.0, 1_000_000.0);
     ui.horizontal(|ui| {
-        ui.label(label);
-        let h = ui.spacing().interact_size.y;
-        let resp = ui.add_sized(egui::vec2(84.0, h), egui::DragValue::new(&mut value).range(range).speed(speed).suffix(suffix));
-        if resp.changed() {
-            let mut p = json!({"id": id});
-            p[key] = json!(value);
-            p["coalesce"] = json!(coalesce);
-            run.push((cmd, p));
-        }
+        ui.label(egui::RichText::new(tl!("Length")).color(t.text_dim));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if widgets::value_field(ui, &mut v, 1.0..=1_000_000.0, " px", 72.0).changed() {
+                push_num(run, id, "assist.setLength", "length", "assist-length", f64::from(v));
+            }
+        });
     });
+    let mut lv = v.max(1.0).ln();
+    if widgets::slider(ui, &mut lv, 0.0..=1_000_000.0_f32.ln(), None).changed() {
+        push_num(run, id, "assist.setLength", "length", "assist-length", f64::from(lv.exp()));
+    }
+}
+
+/// Parallel line count: whole lines 1–16.
+fn count_row(ui: &mut egui::Ui, id: u64, value: u32, run: &mut Vec<(&str, serde_json::Value)>) {
+    let mut v = value as f32;
+    let resp = widgets::slider_row_prec(ui, "Lines", &mut v, 1.0..=16.0, "", None, widgets::RowGestures::default(), Some(0));
+    if resp.changed() {
+        let mut p = json!({"id": id});
+        p["count"] = json!(v.round() as u32);
+        p["coalesce"] = json!("assist-count");
+        run.push(("assist.setParallelCount", p));
+    }
+}
+
+fn push_num(run: &mut Vec<(&str, serde_json::Value)>, id: u64, cmd: &'static str, key: &'static str, coalesce: &'static str, value: f64) {
+    let mut p = json!({"id": id});
+    p[key] = json!(value);
+    p["coalesce"] = json!(coalesce);
+    run.push((cmd, p));
 }
 
 /// The popup slider's current guide length, if the kind has one.
@@ -288,6 +325,15 @@ fn spacing_of(app: &PhotocraftApp, id: u64) -> Option<f64> {
     match &st.doc.assistants.get(AssistantId(id))?.kind {
         DrawingAssistantKind::Parallel(p) => Some(p.spacing),
         DrawingAssistantKind::Concentric(c) => Some(c.spacing),
+        _ => None,
+    }
+}
+
+/// The popup slider's current line count for a parallel item.
+fn count_of(app: &PhotocraftApp, id: u64) -> Option<u32> {
+    let st = app.session.active()?;
+    match &st.doc.assistants.get(AssistantId(id))?.kind {
+        DrawingAssistantKind::Parallel(p) => Some(p.count.max(1)),
         _ => None,
     }
 }
@@ -368,18 +414,15 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             if ui.checkbox(&mut enabled, tl!("Snap to Assistants")).changed() {
                 run.push(("assist.setSnap", json!({"enabled": enabled})));
             }
-            ui.horizontal(|ui| {
-                ui.label(tl!("Magnetism"));
-                let mut px = radius;
-                let h = ui.spacing().interact_size.y;
-                let resp =
-                    ui.add_sized(egui::vec2(84.0, h), egui::DragValue::new(&mut px).range(0.0..=photocraft_doc::MAX_SNAP_RADIUS).speed(0.5).suffix(" px"));
+            {
+                let mut px = radius as f32;
+                let resp = widgets::slider_row(ui, tl!("Magnetism"), &mut px, 0.0..=photocraft_doc::MAX_SNAP_RADIUS as f32, " px", None);
                 if resp.changed() {
-                    let mut p = json!({"radius": px});
+                    let mut p = json!({"radius": f64::from(px)});
                     p["coalesce"] = json!("assist-radius");
                     run.push(("assist.setSnap", p));
                 }
-            });
+            }
             ui.separator();
             ui.menu_button(tl!("New Assistant"), |ui| {
                 widgets::menu_scroll(ui, |ui| {
@@ -410,12 +453,12 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         .items
                         .iter()
                         .map(|a| {
-                            let none = Extras { rays: false, spacing: false, strength: false, length: false };
+                            let none = Extras { rays: false, spacing: false, strength: false, length: false, count: false };
                             let (kind, extras) = match &a.kind {
                                 DrawingAssistantKind::StraightLine(_) => (tl!("Line").to_string(), Extras { length: true, ..none }),
                                 DrawingAssistantKind::Perspective(_) => (tl!("Perspective").to_string(), Extras { rays: true, length: true, ..none }),
                                 DrawingAssistantKind::Bezier(_) => (tl!("Bezier").to_string(), none),
-                                DrawingAssistantKind::Parallel(_) => (tl!("Parallel").to_string(), Extras { spacing: true, length: true, ..none }),
+                                DrawingAssistantKind::Parallel(_) => (tl!("Parallel").to_string(), Extras { spacing: true, length: true, count: true, ..none }),
                                 DrawingAssistantKind::Ellipse(_) => (tl!("Ellipse").to_string(), none),
                                 DrawingAssistantKind::Concentric(_) => (tl!("Concentric").to_string(), Extras { spacing: true, ..none }),
                                 DrawingAssistantKind::Polygon(_) => (tl!("Polygon").to_string(), none),
@@ -472,8 +515,8 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         tl!("Ray step"),
                         ray_step_of(app, id).unwrap_or(15.0),
                         1.0..=180.0,
-                        0.5,
                         "°",
+                        None,
                         &mut run,
                         id,
                         "assist.setRayStep",
@@ -486,9 +529,9 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         ui,
                         tl!("Spacing"),
                         spacing_of(app, id).unwrap_or(20.0),
-                        1.0..=1000000.0,
-                        0.5,
+                        1.0..=500.0,
                         " px",
+                        None,
                         &mut run,
                         id,
                         "assist.setSpacing",
@@ -496,14 +539,17 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         "assist-spacing",
                     );
                 }
+                if extras.count {
+                    count_row(ui, id, count_of(app, id).unwrap_or(2), &mut run);
+                }
                 if extras.strength {
                     slider_row(
                         ui,
                         tl!("Strength"),
                         strength_of(app, id).unwrap_or(0.65),
                         0.0..=1.0,
-                        0.01,
                         "",
+                        Some(2),
                         &mut run,
                         id,
                         "assist.setFisheyeStrength",
@@ -512,19 +558,7 @@ pub fn menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     );
                 }
                 if extras.length {
-                    slider_row(
-                        ui,
-                        tl!("Length"),
-                        length_of(app, id).unwrap_or(100.0),
-                        1.0..=1000000.0,
-                        1.0,
-                        " px",
-                        &mut run,
-                        id,
-                        "assist.setLength",
-                        "length",
-                        "assist-length",
-                    );
+                    length_row(ui, id, length_of(app, id).unwrap_or(100.0), &mut run);
                 }
             }
             for (id, params) in run {

@@ -225,6 +225,11 @@ impl PerspectiveAssistant {
     }
 }
 
+/// Parallel lines without a stored count (older bundles) behave as the two-line default.
+fn default_parallel_count() -> u32 {
+    2
+}
+
 /// A usable guide spacing: finite, positive, and bounded (a planet-sized comb is a mistake).
 fn valid_spacing(s: f64) -> bool {
     s.is_finite() && s > 0.0 && s <= MAX_COORDINATE
@@ -341,21 +346,26 @@ pub struct ParallelAssistant {
     pub spacing: f64,
     /// Segment length like [`StraightLineAssistant::length`]: 0 or negative is infinite.
     pub length: f64,
+    /// How many parallel lines exist, base included (default 2: the base plus one). Only
+    /// these snap and draw — never a canvas-covering comb.
+    #[serde(default = "default_parallel_count")]
+    pub count: u32,
 }
 
 impl Default for ParallelAssistant {
     fn default() -> Self {
-        Self { anchor: [0.0, 0.0], angle_deg: 0.0, spacing: 20.0, length: 0.0 }
+        Self { anchor: [0.0, 0.0], angle_deg: 0.0, spacing: 20.0, length: 0.0, count: 2 }
     }
 }
 
 impl ParallelAssistant {
-    /// `None` for a bad anchor, a non-finite angle, or an unusable spacing.
-    pub fn new(anchor: [f64; 2], angle_deg: f64, spacing: f64) -> Option<Self> {
-        if !in_range(anchor) || dir_from_deg(angle_deg).is_none() || !valid_spacing(spacing) {
+    /// `None` for a bad anchor, a non-finite angle, an unusable spacing, or a line count
+    /// outside 1–16.
+    pub fn new(anchor: [f64; 2], angle_deg: f64, spacing: f64, count: u32) -> Option<Self> {
+        if !in_range(anchor) || dir_from_deg(angle_deg).is_none() || !valid_spacing(spacing) || !(1..=16).contains(&count) {
             return None;
         }
-        Some(Self { anchor, angle_deg, spacing, length: 0.0 })
+        Some(Self { anchor, angle_deg, spacing, length: 0.0, count })
     }
 
     /// Half-extent of each family segment, or `None` for infinite lines.
@@ -744,16 +754,14 @@ impl DrawingAssistant for BezierAssistant {
         if !self.points.iter().all(|p| in_range(*p)) {
             return out;
         }
-        // The curve as short solid majors, the control polygon as dotted minors.
+        // The curve as short solid majors; only the four control-point dots besides it —
+        // no control-polygon chords (users asked for points, not more straight lines).
         const STEPS: usize = 24;
         let mut prev = bezier_eval(&self.points, 0.0);
         for i in 1..=STEPS {
             let q = bezier_eval(&self.points, i as f64 / STEPS as f64);
             out.push(GuidePrimitive::Segment { a: prev, b: q, major: true });
             prev = q;
-        }
-        for w in self.points.windows(2) {
-            out.push(GuidePrimitive::Segment { a: w[0], b: w[1], major: false });
         }
         let _ = viewport;
         for (i, p) in self.points.iter().enumerate() {
@@ -772,6 +780,9 @@ impl DrawingAssistant for ParallelAssistant {
         let n = [-d[1], d[0]];
         let s = (point[0] - self.anchor[0]) * n[0] + (point[1] - self.anchor[1]) * n[1];
         let k = (s / self.spacing).round();
+        if k < 0.0 || k > f64::from(self.count.saturating_sub(1)) {
+            return None;
+        }
         let off = s - k * self.spacing;
         if let Some(half) = self.half() {
             let c = [self.anchor[0] + n[0] * k * self.spacing, self.anchor[1] + n[1] * k * self.spacing];
@@ -798,32 +809,12 @@ impl DrawingAssistant for ParallelAssistant {
         if let Some([a, b]) = seg(self.anchor) {
             out.push(GuidePrimitive::Segment { a, b, major: true });
         }
-        // Family lines covering the viewport, strided so a dense comb stays bounded.
+        // Exactly `count` parallels besides the base — never a comb.
         let n = [-d[1], d[0]];
-        let corners = [[viewport[0], viewport[1]], [viewport[2], viewport[1]], [viewport[2], viewport[3]], [viewport[0], viewport[3]]];
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for c in corners {
-            let s = (c[0] - self.anchor[0]) * n[0] + (c[1] - self.anchor[1]) * n[1];
-            lo = lo.min(s);
-            hi = hi.max(s);
-        }
-        if !(lo.is_finite() && hi.is_finite()) {
-            return out;
-        }
-        // Family lines covering the viewport; a sub-pixel comb draws as the base line.
-        if (hi - lo) / self.spacing <= 256.0 {
-            let start = (lo / self.spacing).floor();
-            let count = ((hi - lo) / self.spacing).ceil() as usize;
-            for j in 0..=count.min(256) {
-                let k = start + j as f64;
-                if k == 0.0 {
-                    continue;
-                }
-                let a = [self.anchor[0] + n[0] * k * self.spacing, self.anchor[1] + n[1] * k * self.spacing];
-                if let Some([p, q]) = seg(a) {
-                    out.push(GuidePrimitive::Segment { a: p, b: q, major: false });
-                }
+        for k in 1..self.count.min(16) {
+            let c = [self.anchor[0] + n[0] * f64::from(k) * self.spacing, self.anchor[1] + n[1] * f64::from(k) * self.spacing];
+            if let Some([p, q]) = seg(c) {
+                out.push(GuidePrimitive::Segment { a: p, b: q, major: k == 0 });
             }
         }
         out.push(GuidePrimitive::Handle { pos: self.anchor, kind: HandleKind::Anchor });
