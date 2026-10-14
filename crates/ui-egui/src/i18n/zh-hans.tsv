@@ -328,6 +328,11 @@
 	Delete Layer	删除图层
 	Delete this assistant	删除此助手
 	Delete	删除
+	Add Vanishing Point	添加消失点
+	Add Guide	添加辅助线
+	Vanishing point	消失点
+	Guide	辅助线
+	Drag a guide on the canvas to select it.	在画布上拖动辅助线以选中它。
 	Rename Layer	重命名图层
 	Create Layer	创建图层
 	Layer Style	图层样式

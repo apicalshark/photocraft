@@ -57,7 +57,7 @@ fn item_json(a: &DrawingAssistantItem) -> Value {
         DrawingAssistantKind::StraightLine(l) => ("straightLine", json!({"anchor": l.anchor, "angleDeg": l.angle_deg, "length": l.length})),
         DrawingAssistantKind::Perspective(p) => (
             "perspective",
-            json!({"points": p.vps, "horizonY": p.horizon_y, "length": p.length, "rays": p.rays.iter().map(|r| json!({"vp": r.vp, "angleDeg": r.angle_deg})).collect::<Vec<_>>()}),
+            json!({"points": p.vps, "horizonY": p.horizon_y, "length": p.length, "pinned": p.pinned, "rays": p.rays.iter().map(|r| json!({"vp": r.vp, "angleDeg": r.angle_deg})).collect::<Vec<_>>()}),
         ),
         DrawingAssistantKind::Bezier(b) => ("bezier", json!({"points": b.points})),
         DrawingAssistantKind::Parallel(p) => {
@@ -68,7 +68,7 @@ fn item_json(a: &DrawingAssistantItem) -> Value {
         DrawingAssistantKind::Polygon(g) => ("polygon", json!({"center": g.center, "radius": g.radius, "sides": g.sides, "rotationDeg": g.rotation_deg})),
         DrawingAssistantKind::Fisheye(f) => (
             "fisheye",
-            json!({"center": f.center, "radius": f.radius, "strength": f.strength, "points": f.vps, "horizonY": f.horizon_y,
+            json!({"center": f.center, "radius": f.radius, "strength": f.strength, "points": f.vps, "horizonY": f.horizon_y, "pinned": f.pinned,
                 "rays": f.rays.iter().map(|r| json!({"vp": r.vp, "angleDeg": r.angle_deg})).collect::<Vec<_>>()}),
         ),
     };
@@ -351,13 +351,21 @@ fn move_vanishing_point(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.edit("Move Vanishing Point", |doc, _| {
         let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
+        let i = index as usize;
+        let pinned = match &a.kind {
+            DrawingAssistantKind::Perspective(guide) => guide.vp_pinned(i),
+            DrawingAssistantKind::Fisheye(fish) => fish.vp_pinned(i),
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "this assistant has no vanishing points".into() }),
+        };
+        if pinned {
+            return Err(EngineError::BadParams { cmd: CMD.into(), msg: format!("vanishing point {index} is fixed (unpin it first)") });
+        }
         let vps = match &mut a.kind {
             DrawingAssistantKind::Perspective(guide) => &mut guide.vps,
             DrawingAssistantKind::Fisheye(fish) => &mut fish.vps,
             _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "this assistant has no vanishing points".into() }),
         };
-        let slot =
-            vps.get_mut(index as usize).ok_or_else(|| EngineError::BadParams { cmd: CMD.into(), msg: format!("vanishing point {index} does not exist") })?;
+        let slot = vps.get_mut(i).ok_or_else(|| EngineError::BadParams { cmd: CMD.into(), msg: format!("vanishing point {index} does not exist") })?;
         if !(point[0].is_finite()
             && point[1].is_finite()
             && point[0].abs() <= photocraft_doc::MAX_ASSISTANT_COORDINATE
@@ -369,6 +377,150 @@ fn move_vanishing_point(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(json!({"id": id.0, "index": index, "point": point}))
+}
+
+fn vp_index_param(p: &Value, cmd: &str) -> Result<usize> {
+    p.get("index").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).ok_or_else(|| bad(cmd, "`index` must be a whole number"))
+}
+
+fn fan_assistant_mut(s: &mut Session, cmd: &str, p: &Value) -> Result<AssistantId> {
+    let id = get_mut(s, cmd, p)?;
+    let st = s.active().ok_or(EngineError::NoDocument)?;
+    match &st.doc.assistants.get(id).map(|a| &a.kind) {
+        Some(DrawingAssistantKind::Perspective(_)) | Some(DrawingAssistantKind::Fisheye(_)) => Ok(id),
+        _ => Err(bad(cmd, "only perspective and fisheye assistants have vanishing points and guides")),
+    }
+}
+
+/// Append a vanishing point (default: canvas centre — drag its diamond to place it).
+fn add_vanishing_point(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.addVanishingPoint";
+    let id = fan_assistant_mut(s, CMD, p)?;
+    let st = s.active().ok_or(EngineError::NoDocument)?;
+    let center = [f64::from(st.doc.size.width) / 2.0, f64::from(st.doc.size.height) / 2.0];
+    let point = anchor_param(p, CMD, "point", center)?;
+    let mut index = 0;
+    s.edit("Add Vanishing Point", |doc, _| {
+        let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
+        index = match &mut a.kind {
+            DrawingAssistantKind::Perspective(guide) => guide.add_vanishing_point(point),
+            DrawingAssistantKind::Fisheye(fish) => fish.add_vanishing_point(point),
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only perspective and fisheye assistants have vanishing points".into() }),
+        }
+        .map_err(|msg| EngineError::BadParams { cmd: CMD.into(), msg: msg.into() })?;
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "index": index, "point": point}))
+}
+
+/// Delete a vanishing point with its guides (keeps at least one; higher indices remap).
+fn remove_vanishing_point(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.removeVanishingPoint";
+    let id = fan_assistant_mut(s, CMD, p)?;
+    let index = vp_index_param(p, CMD)?;
+    s.edit("Delete Vanishing Point", |doc, _| {
+        let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
+        match &mut a.kind {
+            DrawingAssistantKind::Perspective(guide) => guide.remove_vanishing_point(index),
+            DrawingAssistantKind::Fisheye(fish) => fish.remove_vanishing_point(index),
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only perspective and fisheye assistants have vanishing points".into() }),
+        }
+        .map_err(|msg| EngineError::BadParams { cmd: CMD.into(), msg: msg.into() })?;
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "index": index}))
+}
+
+/// Append one guide through a vanishing point (defaults: its first free 15° step).
+fn add_guide(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.addGuide";
+    let id = fan_assistant_mut(s, CMD, p)?;
+    let vp = p.get("vp").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(0);
+    let angle = match p.get("angleDeg") {
+        None => None,
+        Some(v) => Some(v.as_f64().ok_or_else(|| bad(CMD, "`angleDeg` must be a number (degrees)"))?),
+    };
+    let mut index = 0;
+    s.edit("Add Guide", |doc, _| {
+        let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
+        let (vps_len, free) = match &a.kind {
+            DrawingAssistantKind::Perspective(guide) => (guide.vps.len(), guide.free_guide_angle(vp)),
+            DrawingAssistantKind::Fisheye(fish) => (fish.vps.len(), fish.free_guide_angle(vp)),
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only perspective and fisheye assistants have guides".into() }),
+        };
+        if vp >= vps_len {
+            return Err(EngineError::BadParams { cmd: CMD.into(), msg: "vanishing point does not exist".into() });
+        }
+        let angle = angle.unwrap_or(free);
+        index = match &mut a.kind {
+            DrawingAssistantKind::Perspective(guide) => guide.add_guide(vp, angle),
+            DrawingAssistantKind::Fisheye(fish) => fish.add_guide(vp, angle),
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only perspective and fisheye assistants have guides".into() }),
+        }
+        .map_err(|msg| EngineError::BadParams { cmd: CMD.into(), msg: msg.into() })?;
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "index": index, "vp": vp}))
+}
+
+/// Delete one guide by ray index (canvas-selected guides delete through this).
+fn remove_guide(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.removeGuide";
+    let id = fan_assistant_mut(s, CMD, p)?;
+    let index = vp_index_param(p, CMD)?;
+    s.edit("Delete Guide", |doc, _| {
+        let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
+        match &mut a.kind {
+            DrawingAssistantKind::Perspective(guide) => guide.remove_guide(index),
+            DrawingAssistantKind::Fisheye(fish) => fish.remove_guide(index),
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only perspective and fisheye assistants have guides".into() }),
+        }
+        .map_err(|msg| EngineError::BadParams { cmd: CMD.into(), msg: msg.into() })?;
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "index": index}))
+}
+
+/// Rotate one guide about its vanishing point (canvas guide drags commit this).
+fn rotate_guide(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.rotateGuide";
+    let id = fan_assistant_mut(s, CMD, p)?;
+    let index = vp_index_param(p, CMD)?;
+    let angle = angle_param(p, CMD, "angleDeg", f64::NAN)?;
+    if p.get("angleDeg").is_none() {
+        return Err(bad(CMD, "missing `angleDeg`"));
+    }
+    s.edit("Rotate Guide", |doc, _| {
+        let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
+        match &mut a.kind {
+            DrawingAssistantKind::Perspective(guide) => guide.rotate_guide(index, angle),
+            DrawingAssistantKind::Fisheye(fish) => fish.rotate_guide(index, angle),
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only perspective and fisheye assistants have guides".into() }),
+        }
+        .map_err(|msg| EngineError::BadParams { cmd: CMD.into(), msg: msg.into() })?;
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "index": index, "angleDeg": angle}))
+}
+
+/// Pin or unpin a vanishing point (Clip Studio Paint's fixed vanishing points: canvas drags
+/// refuse pinned points, explicit deletion still removes them).
+fn set_vanishing_point_fixed(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "assist.setVanishingPointFixed";
+    let id = fan_assistant_mut(s, CMD, p)?;
+    let index = vp_index_param(p, CMD)?;
+    let fixed = p.get("fixed").and_then(Value::as_bool).ok_or_else(|| bad(CMD, "`fixed` must be a boolean"))?;
+    s.edit(if fixed { "Fix Vanishing Point" } else { "Unfix Vanishing Point" }, |doc, _| {
+        let Some(a) = doc.assistants.get_mut(id) else { return Ok(()) };
+        match &mut a.kind {
+            DrawingAssistantKind::Perspective(guide) => guide.set_vp_pinned(index, fixed),
+            DrawingAssistantKind::Fisheye(fish) => fish.set_vp_pinned(index, fixed),
+            _ => return Err(EngineError::BadParams { cmd: CMD.into(), msg: "only perspective and fisheye assistants have vanishing points".into() }),
+        }
+        .map_err(|msg| EngineError::BadParams { cmd: CMD.into(), msg: msg.into() })?;
+        Ok(())
+    })?;
+    Ok(json!({"id": id.0, "index": index, "fixed": fixed}))
 }
 
 /// Rename an assistant (options-bar popup inline edit).
@@ -919,9 +1071,69 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Move Vanishing Point",
             menu: &[],
             shortcut: None,
-            params: r##"{"id":assistant id,"index":vanishing point,"point":[x,y]}"##,
+            params: r##"{"id":assistant id,"index":vanishing point,"point":[x,y]} — refuses pinned points"##,
             enabled: has_doc,
             run: move_vanishing_point,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.addVanishingPoint",
+            label: "Add Vanishing Point",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":assistant id,"point":[x,y]?=canvas centre} — drag its diamond to place it"##,
+            enabled: has_doc,
+            run: add_vanishing_point,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.removeVanishingPoint",
+            label: "Delete Vanishing Point",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":assistant id,"index":vanishing point} — keeps at least one, higher guides remap"##,
+            enabled: has_doc,
+            run: remove_vanishing_point,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.addGuide",
+            label: "Add Guide",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":assistant id,"vp":vanishing point=0,"angleDeg":degrees?=first free 15° step}"##,
+            enabled: has_doc,
+            run: add_guide,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.removeGuide",
+            label: "Delete Guide",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":assistant id,"index":guide ray} — canvas-selected guides delete through this"##,
+            enabled: has_doc,
+            run: remove_guide,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.rotateGuide",
+            label: "Rotate Guide",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":assistant id,"index":guide ray,"angleDeg":degrees} — canvas guide drags commit this"##,
+            enabled: has_doc,
+            run: rotate_guide,
+            journal: true,
+        },
+        CommandSpec {
+            id: "assist.setVanishingPointFixed",
+            label: "Fix Vanishing Point",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"id":assistant id,"index":vanishing point,"fixed":bool} — canvas drags refuse pinned points"##,
+            enabled: has_doc,
+            run: set_vanishing_point_fixed,
             journal: true,
         },
         CommandSpec {
@@ -1306,6 +1518,15 @@ mod tests {
             ("assist.moveAnchor", json!({"id": 1})),
             ("assist.setAngle", json!({"id": 1})),
             ("assist.moveVanishingPoint", json!({"id": 1, "index": 0})),
+            ("assist.addVanishingPoint", json!({"id": 1, "point": [f64::NAN, 0.0]})),
+            ("assist.removeVanishingPoint", json!({"id": 1})),
+            ("assist.removeVanishingPoint", json!({"id": 1, "index": 99})),
+            ("assist.addGuide", json!({"id": 1})),
+            ("assist.addGuide", json!({"id": 1, "vp": 99, "angleDeg": 0.0})),
+            ("assist.removeGuide", json!({"id": 1})),
+            ("assist.rotateGuide", json!({"id": 1, "index": 0})),
+            ("assist.rotateGuide", json!({"id": 1, "index": 0, "angleDeg": f64::INFINITY})),
+            ("assist.setVanishingPointFixed", json!({"id": 1, "index": 0})),
         ] {
             assert!(s.execute(id, params).is_err(), "{id}");
         }

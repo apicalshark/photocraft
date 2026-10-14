@@ -1085,6 +1085,11 @@ pub struct UiState {
     /// Transient popup state, never serialized.
     #[serde(skip)]
     pub assistant_rename: Option<(u64, String)>,
+    /// The popup's selected assistant guide: (id, vanishing point or guide ray). Set by
+    /// grabbing a handle or guide line on the canvas; drives the per-point operations.
+    /// Transient popup state, never serialized.
+    #[serde(skip)]
+    pub assistant_sel: Option<(u64, photocraft_doc::HandleKind)>,
     /// The Properties panel's armed Levels/Curves eyedropper on an adjustment layer (`layer_picker`),
     /// exposed to automation but never restored from settings.
     #[serde(default, skip_deserializing)]
@@ -1290,6 +1295,7 @@ impl Default for UiState {
             symmetry_transform: None,
             assistant_drag: None,
             assistant_rename: None,
+            assistant_sel: None,
             layer_picker: None,
             mask_target: false,
             vector_mask_target: false,

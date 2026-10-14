@@ -2738,6 +2738,11 @@ cameraRaw	Yellow	Sárga
 	Default restored.	Alapértelmezés visszaállítva.
 	Defaults	Alapértékek
 	Delete	Törlés
+	Add Vanishing Point	Iránypont hozzáadása
+	Add Guide	Segédvonal hozzáadása
+	Vanishing point	Iránypont
+	Guide	Segédvonal
+	Drag a guide on the canvas to select it.	Húzzon el egy segédvonalat a vásznon a kiválasztásához.
 	Delete Shortcut	Billentyűparancs törlése
 	Description	Leírás
 	Diffusion	Diffúzió

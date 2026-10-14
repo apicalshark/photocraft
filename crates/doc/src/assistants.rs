@@ -172,6 +172,11 @@ pub struct PerspectiveAssistant {
     pub rays: Vec<PerspectiveRay>,
     /// Ray length from each vanishing point (0 or negative keeps the legacy infinite rays).
     pub length: f64,
+    /// Pinned (fixed) vanishing-point indices: canvas drags refuse to move these (Clip Studio
+    /// Paint's fixed vanishing points); explicit deletion still removes them. Older bundles
+    /// without the field open with nothing pinned.
+    #[serde(default)]
+    pub pinned: Vec<usize>,
 }
 
 impl PerspectiveAssistant {
@@ -192,7 +197,7 @@ impl PerspectiveAssistant {
         if rays.len() > MAX_RAYS || rays.iter().any(|r| r.vp >= vps.len() || dir_from_deg(r.angle_deg).is_none()) {
             return None;
         }
-        Some(Self { vps, horizon_y, rays, length: 0.0 })
+        Some(Self { vps, horizon_y, rays, length: 0.0, pinned: Vec::new() })
     }
 
     /// Vanishing points with a fan of rays every `step_deg` degrees plus the horizon through
@@ -223,6 +228,53 @@ impl PerspectiveAssistant {
         }
         Self::new(vps, horizon, rays)
     }
+
+    /// Append a vanishing point; returns its index.
+    pub fn add_vanishing_point(&mut self, point: [f64; 2]) -> Result<usize, &'static str> {
+        fan_add_vp(&mut self.vps, point)
+    }
+
+    /// Delete vanishing point `index` with its guides (pins and higher indices remap).
+    pub fn remove_vanishing_point(&mut self, index: usize) -> Result<(), &'static str> {
+        fan_remove_vp(&mut self.vps, &mut self.pinned, &mut self.rays, index)
+    }
+
+    /// Append one guide through vanishing point `vp` at `angle_deg`; returns its ray index.
+    pub fn add_guide(&mut self, vp: usize, angle_deg: f64) -> Result<usize, &'static str> {
+        fan_add_ray(self.vps.len(), &mut self.rays, vp, angle_deg)
+    }
+
+    /// Delete the guide at ray `index`.
+    pub fn remove_guide(&mut self, index: usize) -> Result<(), &'static str> {
+        fan_remove_ray(&mut self.rays, index)
+    }
+
+    /// Rotate the guide at ray `index` to `angle_deg` (canvas guide drags commit this).
+    pub fn rotate_guide(&mut self, index: usize, angle_deg: f64) -> Result<(), &'static str> {
+        fan_rotate_ray(&mut self.rays, index, angle_deg)
+    }
+
+    /// The "add guide" default for `vp`: the first free 15° step.
+    pub fn free_guide_angle(&self, vp: usize) -> f64 {
+        fan_free_angle(&self.rays, vp)
+    }
+
+    /// Whether vanishing point `index` is pinned (out of range reads as unpinned, never panics).
+    pub fn vp_pinned(&self, index: usize) -> bool {
+        self.pinned.contains(&index)
+    }
+
+    /// Pin or unpin vanishing point `index`.
+    pub fn set_vp_pinned(&mut self, index: usize, pinned: bool) -> Result<(), &'static str> {
+        if index >= self.vps.len() {
+            return Err("vanishing point does not exist");
+        }
+        self.pinned.retain(|p| *p != index);
+        if pinned {
+            self.pinned.push(index);
+        }
+        Ok(())
+    }
 }
 
 /// Parallel lines without a stored count (older bundles) behave as the two-line default.
@@ -233,6 +285,88 @@ fn default_parallel_count() -> u32 {
 /// A usable guide spacing: finite, positive, and bounded (a planet-sized comb is a mistake).
 fn valid_spacing(s: f64) -> bool {
     s.is_finite() && s > 0.0 && s <= MAX_COORDINATE
+}
+
+/// Shared fan bookkeeping for perspective and fisheye assistants: explicit vanishing points
+/// with individual guide rays, as in Clip Studio Paint's perspective rulers (add/delete a
+/// vanishing point, add/delete/rotate one guide). All total: bad input is `Err`, never a
+/// panic; callers apply the result inside their own history step.
+fn fan_add_vp(vps: &mut Vec<[f64; 2]>, point: [f64; 2]) -> Result<usize, &'static str> {
+    if !in_range(point) {
+        return Err("vanishing point must be finite coordinates within ±1000000");
+    }
+    if vps.len() >= MAX_VANISHING_POINTS {
+        return Err("this assistant already holds 8 vanishing points");
+    }
+    vps.push(point);
+    Ok(vps.len() - 1)
+}
+
+fn fan_remove_vp(vps: &mut Vec<[f64; 2]>, pinned: &mut Vec<usize>, rays: &mut Vec<PerspectiveRay>, index: usize) -> Result<(), &'static str> {
+    if index >= vps.len() {
+        return Err("vanishing point does not exist");
+    }
+    if vps.len() <= 1 {
+        return Err("an assistant needs at least one vanishing point");
+    }
+    vps.remove(index);
+    rays.retain(|r| r.vp != index);
+    for r in rays.iter_mut() {
+        if r.vp > index {
+            r.vp -= 1;
+        }
+    }
+    pinned.retain(|p| *p != index);
+    for p in pinned.iter_mut() {
+        if *p > index {
+            *p -= 1;
+        }
+    }
+    Ok(())
+}
+
+fn fan_add_ray(vps_len: usize, rays: &mut Vec<PerspectiveRay>, vp: usize, angle_deg: f64) -> Result<usize, &'static str> {
+    if vp >= vps_len {
+        return Err("vanishing point does not exist");
+    }
+    if dir_from_deg(angle_deg).is_none() {
+        return Err("angle must be a finite angle");
+    }
+    if rays.len() >= MAX_RAYS {
+        return Err("this assistant already holds 360 guides");
+    }
+    rays.push(PerspectiveRay { vp, angle_deg });
+    Ok(rays.len() - 1)
+}
+
+fn fan_remove_ray(rays: &mut Vec<PerspectiveRay>, index: usize) -> Result<(), &'static str> {
+    if index >= rays.len() {
+        return Err("guide does not exist");
+    }
+    rays.remove(index);
+    Ok(())
+}
+
+fn fan_rotate_ray(rays: &mut Vec<PerspectiveRay>, index: usize, angle_deg: f64) -> Result<(), &'static str> {
+    if dir_from_deg(angle_deg).is_none() {
+        return Err("angle must be a finite angle");
+    }
+    let ray = rays.get_mut(index).ok_or("guide does not exist")?;
+    ray.angle_deg = angle_deg;
+    Ok(())
+}
+
+/// First 15° step no guide of `vp` uses yet (0.0 when the fan is full): the "add guide"
+/// default, so a new guide never lands exactly on an old one.
+fn fan_free_angle(rays: &[PerspectiveRay], vp: usize) -> f64 {
+    let mut a = 0.0;
+    while a < 360.0 {
+        if !rays.iter().any(|r| r.vp == vp && (r.angle_deg - a).abs() < 1e-9) {
+            return a;
+        }
+        a += 15.0;
+    }
+    0.0
 }
 
 /// Nearest snap of `point` onto explicit perspective rays plus an optional horizon.
@@ -522,6 +656,28 @@ impl PolygonAssistant {
 }
 
 /// Nearest point on segment `ab` and its distance.
+/// Nearest explicit guide ray to document point `p`: its ray index and distance in
+/// document pixels. The UI hit-tests [`GuidePrimitive::Ray`] primitives through this so guide
+/// lines themselves are draggable; total over any input (degenerate input finds nothing).
+pub fn nearest_ray(prims: &[GuidePrimitive], p: [f64; 2]) -> Option<(usize, f64)> {
+    if !finite2(p) {
+        return None;
+    }
+    let mut best: Option<(usize, f64)> = None;
+    for prim in prims {
+        if let GuidePrimitive::Ray { index, a, b } = *prim {
+            if !(finite2(a) && finite2(b)) {
+                continue;
+            }
+            let (_, dist) = nearest_on_segment(p, a, b);
+            if dist.is_finite() && best.is_none_or(|(_, bd)| dist < bd) {
+                best = Some((index, dist));
+            }
+        }
+    }
+    best
+}
+
 fn nearest_on_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> ([f64; 2], f64) {
     let ab = [b[0] - a[0], b[1] - a[1]];
     let denom = ab[0] * ab[0] + ab[1] * ab[1];
@@ -543,6 +699,9 @@ pub struct FisheyeAssistant {
     pub vps: Vec<[f64; 2]>,
     pub horizon_y: Option<f64>,
     pub rays: Vec<PerspectiveRay>,
+    /// Pinned vanishing-point indices, like [`PerspectiveAssistant::pinned`].
+    #[serde(default)]
+    pub pinned: Vec<usize>,
 }
 
 impl FisheyeAssistant {
@@ -561,7 +720,7 @@ impl FisheyeAssistant {
         if rays.len() > MAX_RAYS || rays.iter().any(|r| r.vp >= vps.len() || dir_from_deg(r.angle_deg).is_none()) {
             return None;
         }
-        Some(Self { center, radius, strength, vps, horizon_y, rays })
+        Some(Self { center, radius, strength, vps, horizon_y, rays, pinned: Vec::new() })
     }
 
     /// Distort plate point `q` into lens space; `None` outside the lens.
@@ -600,6 +759,53 @@ impl FisheyeAssistant {
         let r = 0.5 * (lo + hi);
         Some([self.center[0] + self.radius * dx / rv * r, self.center[1] + self.radius * dy / rv * r])
     }
+
+    /// Append a vanishing point; returns its index.
+    pub fn add_vanishing_point(&mut self, point: [f64; 2]) -> Result<usize, &'static str> {
+        fan_add_vp(&mut self.vps, point)
+    }
+
+    /// Delete vanishing point `index` with its guides (pins and higher indices remap).
+    pub fn remove_vanishing_point(&mut self, index: usize) -> Result<(), &'static str> {
+        fan_remove_vp(&mut self.vps, &mut self.pinned, &mut self.rays, index)
+    }
+
+    /// Append one guide through vanishing point `vp` at `angle_deg`; returns its ray index.
+    pub fn add_guide(&mut self, vp: usize, angle_deg: f64) -> Result<usize, &'static str> {
+        fan_add_ray(self.vps.len(), &mut self.rays, vp, angle_deg)
+    }
+
+    /// Delete the guide at ray `index`.
+    pub fn remove_guide(&mut self, index: usize) -> Result<(), &'static str> {
+        fan_remove_ray(&mut self.rays, index)
+    }
+
+    /// Rotate the guide at ray `index` to `angle_deg` (canvas guide drags commit this).
+    pub fn rotate_guide(&mut self, index: usize, angle_deg: f64) -> Result<(), &'static str> {
+        fan_rotate_ray(&mut self.rays, index, angle_deg)
+    }
+
+    /// The "add guide" default for `vp`: the first free 15° step.
+    pub fn free_guide_angle(&self, vp: usize) -> f64 {
+        fan_free_angle(&self.rays, vp)
+    }
+
+    /// Whether vanishing point `index` is pinned (out of range reads as unpinned, never panics).
+    pub fn vp_pinned(&self, index: usize) -> bool {
+        self.pinned.contains(&index)
+    }
+
+    /// Pin or unpin vanishing point `index`.
+    pub fn set_vp_pinned(&mut self, index: usize, pinned: bool) -> Result<(), &'static str> {
+        if index >= self.vps.len() {
+            return Err("vanishing point does not exist");
+        }
+        self.pinned.retain(|p| *p != index);
+        if pinned {
+            self.pinned.push(index);
+        }
+        Ok(())
+    }
 }
 
 /// The guide geometry of one assistant. New kinds only add a variant plus its trait impl:
@@ -624,11 +830,17 @@ pub enum GuidePrimitive {
     /// A guide segment in document pixels. `major` marks the primary guides (the straight
     /// line itself, the horizon): the UI draws those solid and the secondary ray fan dotted.
     Segment { a: [f64; 2], b: [f64; 2], major: bool },
+    /// One explicit guide ray of a perspective/fisheye fan, carrying its index into the
+    /// assistant's rays so canvas drags can grab the line itself (and the popup can name the
+    /// selected guide). Fisheye curves emit one `Ray` per sample pair sharing the index.
+    Ray { index: usize, a: [f64; 2], b: [f64; 2] },
     /// An interactive drag handle in document pixels.
     Handle { pos: [f64; 2], kind: HandleKind },
 }
 
-/// What a [`GuidePrimitive::Handle`] drags.
+/// What a [`GuidePrimitive::Handle`] drags. [`HandleKind::GuideRay`] is grabbed through
+/// the [`GuidePrimitive::Ray`] line itself rather than a dot handle (Clip Studio Paint lets
+/// its guides be dragged directly), and also names the popup's selected guide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandleKind {
     /// The straight-line anchor (moves the line).
@@ -637,6 +849,8 @@ pub enum HandleKind {
     Angle,
     /// Vanishing point `usize` (moves the point and its rays).
     VanishingPoint(usize),
+    /// Guide ray by index into the assistant's rays (rotates about its vanishing point).
+    GuideRay(usize),
     /// A kind-specific control point by index (Bézier control points, ellipse/polygon/fisheye
     /// handles); the command validates the index against the kind.
     ControlPoint(usize),
@@ -704,7 +918,7 @@ impl DrawingAssistant for PerspectiveAssistant {
 
     fn overlay_primitives(&self, viewport: [f64; 4]) -> Vec<GuidePrimitive> {
         let mut out = Vec::new();
-        for ray in &self.rays {
+        for (index, ray) in self.rays.iter().enumerate() {
             let (Some(vp), Some(d)) = (self.vps.get(ray.vp).copied(), dir_from_deg(ray.angle_deg)) else { continue };
             if !in_range(vp) {
                 continue;
@@ -721,7 +935,7 @@ impl DrawingAssistant for PerspectiveAssistant {
                         ([vp[0] + d[0] * lo, vp[1] + d[1] * lo], [vp[0] + d[0] * hi, vp[1] + d[1] * hi])
                     }
                 };
-                out.push(GuidePrimitive::Segment { a, b, major: false });
+                out.push(GuidePrimitive::Ray { index, a, b });
             }
         }
         let [x0, _, x1, _] = viewport;
@@ -965,7 +1179,7 @@ impl DrawingAssistant for FisheyeAssistant {
         }
         // Each ray bent through the lens, sampled and clipped to the disc.
         const SAMPLES: usize = 17;
-        for ray in &self.rays {
+        for (index, ray) in self.rays.iter().enumerate() {
             let (Some(vp), Some(d)) = (self.vps.get(ray.vp).copied(), dir_from_deg(ray.angle_deg)) else { continue };
             if !in_range(vp) {
                 continue;
@@ -980,7 +1194,7 @@ impl DrawingAssistant for FisheyeAssistant {
                 let t = reach * i as f64 / SAMPLES as f64;
                 let bent = self.forward([vp[0] + d[0] * t, vp[1] + d[1] * t]);
                 if let (Some(a), Some(b)) = (prev, bent) {
-                    out.push(GuidePrimitive::Segment { a, b, major: false });
+                    out.push(GuidePrimitive::Ray { index, a, b });
                 }
                 prev = bent;
             }
@@ -1253,12 +1467,18 @@ mod tests {
         assert!(PerspectiveAssistant::new(vec![], None, vec![]).is_none());
         assert!(PerspectiveAssistant::new(vec![[0.0, 0.0]; MAX_VANISHING_POINTS + 1], None, vec![]).is_none());
         assert!(PerspectiveAssistant::new(vec![[0.0, 0.0]], None, vec![PerspectiveRay { vp: 7, angle_deg: 0.0 }]).is_none());
-        let dangling = PerspectiveAssistant { vps: vec![[50.0, 50.0]], horizon_y: None, rays: vec![PerspectiveRay { vp: 3, angle_deg: 0.0 }], length: 0.0 };
+        let dangling = PerspectiveAssistant {
+            vps: vec![[50.0, 50.0]],
+            horizon_y: None,
+            rays: vec![PerspectiveRay { vp: 3, angle_deg: 0.0 }],
+            length: 0.0,
+            pinned: Vec::new(),
+        };
         assert_eq!(dangling.snap_point([50.0, 53.0], 8.0), None);
         // The dangling ray draws no segment, but the valid vanishing point keeps its handle.
         assert!(dangling.overlay_primitives([0.0, 0.0, 100.0, 100.0]).iter().all(|p| matches!(p, GuidePrimitive::Handle { .. })));
         // Empty perspective (valid shape, no guides) snaps to nothing.
-        let empty = PerspectiveAssistant { vps: vec![[50.0, 50.0]], horizon_y: None, rays: vec![], length: 0.0 };
+        let empty = PerspectiveAssistant { vps: vec![[50.0, 50.0]], horizon_y: None, rays: vec![], length: 0.0, pinned: Vec::new() };
         assert_eq!(empty.snap_point([50.0, 53.0], 8.0), None);
     }
 
@@ -1319,7 +1539,7 @@ mod tests {
         let p = PerspectiveAssistant::with_default_rays(vec![[200.0, 150.0]], None, 90.0).expect("guide");
         let prims = p.overlay_primitives([0.0, 0.0, 400.0, 300.0]);
         assert!(prims.iter().any(|p| matches!(p, GuidePrimitive::Segment { major: true, .. })), "the horizon is major");
-        assert!(prims.iter().any(|p| matches!(p, GuidePrimitive::Segment { major: false, .. })), "the ray fan is minor");
+        assert!(prims.iter().any(|p| matches!(p, GuidePrimitive::Ray { .. })), "the ray fan is indexed guides");
     }
 
     #[test]
