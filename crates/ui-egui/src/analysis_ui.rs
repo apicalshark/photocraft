@@ -512,10 +512,10 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
             crate::widgets::vline(ui, 22.0);
             crate::widgets::checkbox(ui, &mut app.ui.analysis.use_measurement_scale, tl!("Use Measurement Scale"));
             let has = doc.measurement.ruler.is_some();
-            if ui.add_enabled_ui(has, |ui| crate::widgets::secondary_button(ui, tl!("Straighten Layer"), 0.0)).inner.clicked() {
+            if ui.add_enabled_ui(has, |ui| crate::widgets::secondary_button(ui, tl!("Straighten Layer"), 0.0).on_hover_text(tl!("Rotate the active layer so the ruler line becomes horizontal"))).inner.clicked() {
                 let _ = app.run("image.analysis.straightenLayer", json!({}));
             }
-            if ui.add_enabled_ui(has, |ui| crate::widgets::secondary_button(ui, tl!("Clear"), 0.0)).inner.clicked() {
+            if ui.add_enabled_ui(has, |ui| crate::widgets::secondary_button(ui, tl!("Clear"), 0.0).on_hover_text(tl!("Clear the ruler line from the canvas"))).inner.clicked() {
                 let _ = app.run("image.analysis.rulerTool", json!({"clear": true}));
             }
             true
